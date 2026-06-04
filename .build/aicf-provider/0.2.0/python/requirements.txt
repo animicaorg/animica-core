@@ -1,2 +1,0 @@
-# Optional dependencies for advanced workers can be added here.
-# The reference worker intentionally runs with Python stdlib only.
