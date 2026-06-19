@@ -12502,6 +12502,14 @@ class P2PService:
                     return
 
     async def _sync_loop_forever(self) -> None:
+        # Rebind the sync lock to THIS running loop. The node can end up running
+        # the sync driver under a different event loop than the one that first
+        # acquired self._sync_lock (e.g. after a soft loop restart). A lock bound
+        # to a dead loop makes every `async with self._sync_lock` raise "Lock is
+        # bound to a different event loop", which freezes sync — the head stops
+        # advancing and the chain looks reset. Recreating it here (entered only
+        # at startup and after a crash-restart, not per tick) keeps it correct.
+        self._sync_lock = asyncio.Lock()
         try:
             while self._running:
                 if not self._sync_enabled:
@@ -15827,6 +15835,21 @@ class P2PService:
                 batch.delete(key)
             else:
                 kv.delete(key)
+        # Reconcile META_CANONICAL_HEIGHT to the rolled-down chain. Pruning the
+        # canonical index above `above_height` lowers the head, but the non-instant
+        # counter is stored separately and would otherwise stay inflated — making
+        # the node believe it is far behind, refuse to mine, and shift the halving
+        # schedule. This is the same bug the snapshot/startup fixes address, on the
+        # P2P reorg-down paths (verifier-limit reorg + reset-to-genesis). Recompute
+        # as the count of non-instant canonical blocks in [1, above_height]
+        # (genesis is always canonical_height 0).
+        try:
+            from core.db.snapshot import _count_non_instant_canonical
+            if hasattr(bdb, "set_canonical_height"):
+                new_ch = _count_non_instant_canonical(bdb, int(above_height))
+                bdb.set_canonical_height(new_ch, batch=batch)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("canonical_height reconcile after prune failed: %s", exc)
         return len(deletions)
 
     def _checkpoint_parent_meta(self, parent_hash: bytes) -> Optional[Tuple[int, int]]:

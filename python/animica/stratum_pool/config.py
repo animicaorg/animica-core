@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from animica.config import load_network_config
 
@@ -43,6 +43,18 @@ class PoolConfig:
     payout_interval_seconds: float = 0.0
     payout_min_amount: int = 1
     payout_wallet: str = ""
+    # Pool-level miner-version enforcement (policy only — never touches consensus).
+    # When require_min_version is set and min_miner_version is non-empty, miners
+    # reporting an older (or no) version are rejected: their shares and AICF jobs
+    # are refused until they update. Reversible by clearing the flag.
+    min_miner_version: str = ""
+    require_min_version: bool = False
+    # ENA training-treasury fee: route this fraction (in basis points) of each
+    # accepted share's ANM credit to the ENA training treasury. The miner keeps
+    # the remainder. 0 disables the fee. The treasury accrues as an ordinary
+    # credited balance and is paid out by the normal payout scheduler.
+    ena_fee_bps: int = 0
+    ena_treasury_address: str = ""
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -50,6 +62,12 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     if val is None or val == "":
         return default
     return val
+
+
+def _as_bool(override: Any, env_val: Optional[str]) -> bool:
+    if override is not None:
+        return bool(override)
+    return str(env_val or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def load_config_from_env(*, overrides: Optional[dict] = None) -> PoolConfig:
@@ -131,6 +149,24 @@ def load_config_from_env(*, overrides: Optional[dict] = None) -> PoolConfig:
         or _env("ANIMICA_POOL_PAYOUT_WALLET", pool_address)
         or ""
     ).strip()
+    min_miner_version = str(
+        overrides.get("min_miner_version")
+        or _env("ANIMICA_POOL_MIN_MINER_VERSION", "")
+        or ""
+    ).strip()
+    require_min_version = _as_bool(
+        overrides.get("require_min_version"),
+        _env("ANIMICA_POOL_REQUIRE_MIN_VERSION", "false"),
+    )
+    ena_fee_bps = int(
+        overrides.get("ena_fee_bps")
+        or _env("ANIMICA_POOL_ENA_FEE_BPS", "0")
+    )
+    ena_treasury_address = str(
+        overrides.get("ena_treasury_address")
+        or _env("ANIMICA_POOL_ENA_TREASURY_ADDRESS", "")
+        or ""
+    ).strip()
 
     if not str(host or "").strip():
         raise ValueError("host must be non-empty")
@@ -177,6 +213,13 @@ def load_config_from_env(*, overrides: Optional[dict] = None) -> PoolConfig:
         raise ValueError(
             "payout_wallet is required when payout_interval_seconds is enabled"
         )
+    if ena_fee_bps < 0 or ena_fee_bps > 10_000:
+        raise ValueError("ena_fee_bps must be between 0 and 10000 (basis points)")
+    if ena_fee_bps > 0 and not ena_treasury_address:
+        raise ValueError(
+            "ena_treasury_address is required when ena_fee_bps > 0 "
+            "(set ANIMICA_POOL_ENA_TREASURY_ADDRESS)"
+        )
 
     return PoolConfig(
         host=host,
@@ -199,4 +242,8 @@ def load_config_from_env(*, overrides: Optional[dict] = None) -> PoolConfig:
         payout_interval_seconds=payout_interval_seconds,
         payout_min_amount=payout_min_amount,
         payout_wallet=payout_wallet,
+        min_miner_version=min_miner_version,
+        require_min_version=require_min_version,
+        ena_fee_bps=ena_fee_bps,
+        ena_treasury_address=ena_treasury_address,
     )

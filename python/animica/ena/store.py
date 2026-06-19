@@ -17,8 +17,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, TypeVar
 
 from .errors import StoreError
 
@@ -126,7 +127,79 @@ CREATE TABLE IF NOT EXISTS wallet_connect (
     created_at  INTEGER NOT NULL,
     expires_at  INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pools (
+    pool_id     TEXT PRIMARY KEY,
+    pool_hash   TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    base_model  TEXT NOT NULL,
+    round       INTEGER NOT NULL DEFAULT 1,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    data        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pools_status ON pools(status);
+CREATE TABLE IF NOT EXISTS pool_shards (
+    shard_id    TEXT PRIMARY KEY,
+    pool_id     TEXT NOT NULL,
+    round       INTEGER NOT NULL,
+    ordinal     INTEGER NOT NULL,
+    status      TEXT NOT NULL,
+    worker_id   TEXT,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    data        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pool_shards_pool ON pool_shards(pool_id);
+CREATE INDEX IF NOT EXISTS idx_pool_shards_status ON pool_shards(status);
+CREATE TABLE IF NOT EXISTS pool_contributions (
+    contribution_id TEXT PRIMARY KEY,
+    pool_id     TEXT NOT NULL,
+    round       INTEGER NOT NULL,
+    role        TEXT NOT NULL,
+    address     TEXT,
+    weight      REAL NOT NULL DEFAULT 0,
+    amount_nano INTEGER NOT NULL DEFAULT 0,
+    paid        INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL,
+    data        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pool_contrib_pool ON pool_contributions(pool_id);
+CREATE TABLE IF NOT EXISTS pool_servers (
+    server_id   TEXT PRIMARY KEY,
+    pool_id     TEXT NOT NULL,
+    worker_id   TEXT,
+    endpoint    TEXT,
+    model_id    TEXT,
+    status      TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    data        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pool_servers_pool ON pool_servers(pool_id);
+CREATE TABLE IF NOT EXISTS models (
+    model_id    TEXT PRIMARY KEY,
+    base_model  TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    data        TEXT NOT NULL
+);
 """
+
+
+_T = TypeVar("_T")
+
+# How long any statement waits for a contended lock before SQLite raises
+# "database is locked". `animica up` runs the trainer, useful-work worker and
+# server as *separate processes*, each with its own connection to this file, so
+# cross-process write contention is normal and must be waited out, not failed.
+_BUSY_TIMEOUT_MS = 30_000
+
+
+def _is_locked_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "locked" in msg or "busy" in msg)
 
 
 class Store:
@@ -137,30 +210,71 @@ class Store:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         try:
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            # `timeout=` installs SQLite's busy handler so a write blocked by a
+            # lock another process holds waits instead of erroring immediately.
+            self._conn = sqlite3.connect(
+                str(self.db_path), check_same_thread=False,
+                timeout=_BUSY_TIMEOUT_MS / 1000.0)
         except sqlite3.Error as exc:  # pragma: no cover
             raise StoreError(f"cannot open ENA db at {self.db_path}: {exc}") from exc
         self._conn.row_factory = sqlite3.Row
+        # WAL = concurrent readers + a single writer. busy_timeout = how long a
+        # contended statement waits before "database is locked". synchronous=
+        # NORMAL is durable under WAL and cuts fsync contention across the
+        # concurrent workers `animica up` launches.
         self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS};")
+        self._conn.execute("PRAGMA synchronous=NORMAL;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
         with self._lock:
-            self._conn.executescript(_SCHEMA)
-            self._conn.commit()
+            self._with_retry(self._init_schema)
+
+    def _init_schema(self) -> None:
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
 
     # -- low-level --------------------------------------------------------
     def close(self) -> None:
         with self._lock:
             self._conn.close()
 
+    def _with_retry(self, fn: Callable[[], _T], *, attempts: int = 6) -> _T:
+        """Run a DB operation, retrying briefly on a locked/busy database.
+
+        busy_timeout already waits out ordinary write contention; this also
+        covers the WAL ``SQLITE_BUSY_SNAPSHOT`` case (a write after another
+        connection advanced the snapshot), which surfaces as "database is
+        locked" and is *not* retried by SQLite's busy handler.
+        """
+        delay = 0.1
+        for i in range(attempts):
+            try:
+                return fn()
+            except sqlite3.OperationalError as exc:
+                if not _is_locked_error(exc) or i == attempts - 1:
+                    raise
+                # Clear any half-open implicit transaction before retrying so the
+                # next attempt starts from a clean snapshot.
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                time.sleep(delay)
+                delay = min(delay * 2.0, 2.0)
+        raise AssertionError("unreachable")  # pragma: no cover
+
     def _exec(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
-        with self._lock:
+        def _run() -> sqlite3.Cursor:
             cur = self._conn.execute(sql, tuple(params))
             self._conn.commit()
             return cur
+        with self._lock:
+            return self._with_retry(_run)
 
     def _query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
         with self._lock:
-            return list(self._conn.execute(sql, tuple(params)).fetchall())
+            return self._with_retry(
+                lambda: list(self._conn.execute(sql, tuple(params)).fetchall()))
 
     # -- jobs -------------------------------------------------------------
     def upsert_job(self, job: dict[str, Any]) -> None:
@@ -437,6 +551,242 @@ class Store:
     def total_funded_nano(self) -> int:
         rows = self._query("SELECT COALESCE(SUM(value_nano),0) FROM payments")
         return int(rows[0][0] or 0) if rows else 0
+
+    # -- pools (collaborative training) -----------------------------------
+    def upsert_pool(self, pool: dict[str, Any]) -> None:
+        self._exec(
+            """INSERT INTO pools
+               (pool_id, pool_hash, name, status, base_model, round,
+                created_at, updated_at, data)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(pool_id) DO UPDATE SET
+                 pool_hash=excluded.pool_hash, name=excluded.name,
+                 status=excluded.status, base_model=excluded.base_model,
+                 round=excluded.round, updated_at=excluded.updated_at,
+                 data=excluded.data""",
+            (pool["pool_id"], pool["pool_hash"], pool["name"], pool["status"],
+             pool["base_model"], pool.get("round", 1), pool.get("created_at", 0),
+             pool.get("updated_at", 0), json.dumps(pool)),
+        )
+
+    def get_pool(self, pool_id: str) -> Optional[dict[str, Any]]:
+        rows = self._query("SELECT data FROM pools WHERE pool_id=?", (pool_id,))
+        return json.loads(rows[0]["data"]) if rows else None
+
+    def list_pools(self, status: Optional[str] = None,
+                   limit: int = 200) -> list[dict[str, Any]]:
+        if status:
+            rows = self._query(
+                "SELECT data FROM pools WHERE status=? ORDER BY created_at DESC LIMIT ?",
+                (status, limit))
+        else:
+            rows = self._query(
+                "SELECT data FROM pools ORDER BY created_at DESC LIMIT ?", (limit,))
+        return [json.loads(r["data"]) for r in rows]
+
+    # -- pool shards ------------------------------------------------------
+    def upsert_shard(self, shard: dict[str, Any]) -> None:
+        self._exec(
+            """INSERT INTO pool_shards
+               (shard_id, pool_id, round, ordinal, status, worker_id,
+                created_at, updated_at, data)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(shard_id) DO UPDATE SET
+                 status=excluded.status, worker_id=excluded.worker_id,
+                 updated_at=excluded.updated_at, data=excluded.data""",
+            (shard["shard_id"], shard["pool_id"], shard["round"], shard["ordinal"],
+             shard["status"], shard.get("worker_id"), shard.get("created_at", 0),
+             shard.get("updated_at", 0), json.dumps(shard)),
+        )
+
+    def get_shard(self, shard_id: str) -> Optional[dict[str, Any]]:
+        rows = self._query("SELECT data FROM pool_shards WHERE shard_id=?", (shard_id,))
+        return json.loads(rows[0]["data"]) if rows else None
+
+    def delete_shards(self, pool_id: str, round: int) -> int:
+        """Remove all shards for a round (used to re-shard a round). Returns the
+        number removed."""
+        with self._lock:
+            n = len(self.list_shards(pool_id, round=round))
+            self._exec("DELETE FROM pool_shards WHERE pool_id=? AND round=?",
+                       (pool_id, round))
+            return n
+
+    def list_shards(self, pool_id: str, round: Optional[int] = None,
+                    status: Optional[str] = None) -> list[dict[str, Any]]:
+        clauses, params = ["pool_id=?"], [pool_id]
+        if round is not None:
+            clauses.append("round=?"); params.append(round)
+        if status:
+            clauses.append("status=?"); params.append(status)
+        rows = self._query(
+            f"SELECT data FROM pool_shards WHERE {' AND '.join(clauses)} "
+            f"ORDER BY ordinal ASC", tuple(params))
+        return [json.loads(r["data"]) for r in rows]
+
+    def claim_one_shard(self, pool_id: str, round: int, worker_id: str, *,
+                        reclaim_before: Optional[int] = None
+                        ) -> Optional[dict[str, Any]]:
+        """Atomically claim the lowest-ordinal AVAILABLE shard for a round.
+
+        Available = ``open`` OR (``claimed`` and last touched before
+        ``reclaim_before``) — so a shard claimed by a worker that died/failed
+        without submitting is reclaimed instead of deadlocking the pool. The
+        whole read-then-update runs under the store lock, so it is race-safe."""
+        from .models import now_ts
+        with self._lock:
+            if reclaim_before is not None:
+                row = self._conn.execute(
+                    "SELECT data, status FROM pool_shards WHERE pool_id=? AND round=? "
+                    "AND (status='open' OR (status='claimed' AND updated_at < ?)) "
+                    "ORDER BY (status='open') DESC, ordinal ASC LIMIT 1",
+                    (pool_id, round, int(reclaim_before))).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT data, status FROM pool_shards WHERE pool_id=? AND round=? "
+                    "AND status='open' ORDER BY ordinal ASC LIMIT 1",
+                    (pool_id, round)).fetchone()
+            if not row:
+                return None
+            shard = json.loads(row["data"])
+            prev_status = shard.get("status")
+            shard["status"] = "claimed"
+            shard["worker_id"] = worker_id
+            shard["updated_at"] = now_ts()
+            cur = self._conn.execute(
+                "UPDATE pool_shards SET status=?, worker_id=?, updated_at=?, data=? "
+                "WHERE shard_id=? AND status=?",
+                (shard["status"], worker_id, shard["updated_at"],
+                 json.dumps(shard), shard["shard_id"], prev_status))
+            self._conn.commit()
+            if cur.rowcount == 0:
+                return None
+            return shard
+
+    def reopen_shard(self, shard_id: str, *, worker_id: Optional[str] = None
+                     ) -> bool:
+        """Return a claimed (un-submitted) shard to the pool. If ``worker_id`` is
+        given, only reopen a shard currently held by that worker. Returns True if
+        a shard was reopened."""
+        from .models import now_ts
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM pool_shards WHERE shard_id=?",
+                (shard_id,)).fetchone()
+            if not row:
+                return False
+            shard = json.loads(row["data"])
+            if shard.get("status") != "claimed":
+                return False
+            if worker_id and shard.get("worker_id") not in (worker_id, None):
+                return False
+            shard["status"] = "open"
+            shard["worker_id"] = None
+            shard["updated_at"] = now_ts()
+            self._conn.execute(
+                "UPDATE pool_shards SET status='open', worker_id=NULL, "
+                "updated_at=?, data=? WHERE shard_id=? AND status='claimed'",
+                (shard["updated_at"], json.dumps(shard), shard_id))
+            self._conn.commit()
+            return True
+
+    # -- pool contributions (reward ledger) -------------------------------
+    def add_contribution(self, contrib: dict[str, Any]) -> None:
+        self._exec(
+            """INSERT OR REPLACE INTO pool_contributions
+               (contribution_id, pool_id, round, role, address, weight,
+                amount_nano, paid, created_at, data)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (contrib["contribution_id"], contrib["pool_id"], contrib["round"],
+             contrib["role"], contrib.get("address"), float(contrib.get("weight", 0)),
+             int(contrib.get("amount_nano", 0)), 1 if contrib.get("paid") else 0,
+             contrib.get("created_at", 0), json.dumps(contrib)),
+        )
+
+    def list_contributions(self, pool_id: str, round: Optional[int] = None,
+                           role: Optional[str] = None,
+                           paid: Optional[bool] = None) -> list[dict[str, Any]]:
+        clauses, params = ["pool_id=?"], [pool_id]
+        if round is not None:
+            clauses.append("round=?"); params.append(round)
+        if role:
+            clauses.append("role=?"); params.append(role)
+        if paid is not None:
+            clauses.append("paid=?"); params.append(1 if paid else 0)
+        rows = self._query(
+            f"SELECT data FROM pool_contributions WHERE {' AND '.join(clauses)} "
+            f"ORDER BY created_at ASC", tuple(params))
+        return [json.loads(r["data"]) for r in rows]
+
+    def mark_contributions_paid(self, contribution_ids: list[str]) -> None:
+        if not contribution_ids:
+            return
+        with self._lock:
+            for cid in contribution_ids:
+                row = self._conn.execute(
+                    "SELECT data FROM pool_contributions WHERE contribution_id=?",
+                    (cid,)).fetchone()
+                if not row:
+                    continue
+                c = json.loads(row["data"])
+                c["paid"] = True
+                self._conn.execute(
+                    "UPDATE pool_contributions SET paid=1, data=? WHERE contribution_id=?",
+                    (json.dumps(c), cid))
+            self._conn.commit()
+
+    # -- pool servers (serve-while-train registry) ------------------------
+    def upsert_server(self, server: dict[str, Any]) -> None:
+        self._exec(
+            """INSERT INTO pool_servers
+               (server_id, pool_id, worker_id, endpoint, model_id, status,
+                created_at, updated_at, data)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(server_id) DO UPDATE SET
+                 worker_id=excluded.worker_id, endpoint=excluded.endpoint,
+                 model_id=excluded.model_id, status=excluded.status,
+                 updated_at=excluded.updated_at, data=excluded.data""",
+            (server["server_id"], server["pool_id"], server.get("worker_id"),
+             server.get("endpoint"), server.get("model_id"), server["status"],
+             server.get("created_at", 0), server.get("updated_at", 0),
+             json.dumps(server)),
+        )
+
+    def get_server(self, server_id: str) -> Optional[dict[str, Any]]:
+        rows = self._query("SELECT data FROM pool_servers WHERE server_id=?", (server_id,))
+        return json.loads(rows[0]["data"]) if rows else None
+
+    def list_servers(self, pool_id: str,
+                     status: Optional[str] = None) -> list[dict[str, Any]]:
+        if status:
+            rows = self._query(
+                "SELECT data FROM pool_servers WHERE pool_id=? AND status=? "
+                "ORDER BY created_at ASC", (pool_id, status))
+        else:
+            rows = self._query(
+                "SELECT data FROM pool_servers WHERE pool_id=? ORDER BY created_at ASC",
+                (pool_id,))
+        return [json.loads(r["data"]) for r in rows]
+
+    # -- global model registry (one model, many pools) --------------------
+    def upsert_model(self, model: dict[str, Any]) -> None:
+        self._exec(
+            """INSERT INTO models (model_id, base_model, created_at, updated_at, data)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(model_id) DO UPDATE SET
+                 base_model=excluded.base_model, updated_at=excluded.updated_at,
+                 data=excluded.data""",
+            (model["model_id"], model["base_model"], model.get("created_at", 0),
+             model.get("updated_at", 0), json.dumps(model)),
+        )
+
+    def get_model(self, model_id: str) -> Optional[dict[str, Any]]:
+        rows = self._query("SELECT data FROM models WHERE model_id=?", (model_id,))
+        return json.loads(rows[0]["data"]) if rows else None
+
+    def list_models(self) -> list[dict[str, Any]]:
+        return [json.loads(r["data"]) for r in
+                self._query("SELECT data FROM models ORDER BY created_at ASC")]
 
     # -- wallet-connect (web/mobile wallet handshake) ---------------------
     def create_wc(self, wc: dict[str, Any]) -> None:

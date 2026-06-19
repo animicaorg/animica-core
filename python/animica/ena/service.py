@@ -96,6 +96,44 @@ def _make_handler(facade):
                     if not rid:
                         return self._send(400, {"error": "id required"})
                     return self._send(200, facade.walletconnect.poll(rid))
+                if path == "/pool/list":
+                    return self._send(200, {"pools": facade.pool.list_pools(
+                        status=q.get("status"))})
+                if path == "/pool/status":
+                    pid = q.get("pool_id")
+                    if not pid:
+                        return self._send(400, {"error": "pool_id required"})
+                    return self._send(200, facade.pool.status(pid))
+                if path == "/pool/shard/data":
+                    sid = q.get("shard_id")
+                    if not sid:
+                        return self._send(400, {"error": "shard_id required"})
+                    return self._send(200, facade.pool.read_shard_data(sid))
+                if path == "/pool/checkpoint":
+                    pid = q.get("pool_id")
+                    if not pid:
+                        return self._send(400, {"error": "pool_id required"})
+                    return self._send(200, facade.pool.read_promoted_checkpoint(pid))
+                if path == "/pool/eval-data":
+                    pid = q.get("pool_id")
+                    if not pid:
+                        return self._send(400, {"error": "pool_id required"})
+                    return self._send(200, facade.pool.read_eval_data(pid))
+                if path == "/pool/tools":
+                    return self._send(200, {"tools": facade.tools.list(
+                        status=q.get("status"))})
+                if path == "/pool/leaderboard":
+                    pid = q.get("pool_id")
+                    if not pid:
+                        return self._send(400, {"error": "pool_id required"})
+                    return self._send(200, {"leaderboard": facade.pool.leaderboard(pid)})
+                if path == "/pool/models":
+                    return self._send(200, {"models": facade.pool.list_models()})
+                if path == "/pool/model":
+                    mid = q.get("model_id")
+                    if not mid:
+                        return self._send(400, {"error": "model_id required"})
+                    return self._send(200, facade.pool.get_global_model(mid))
                 return self._send(404, {"error": "not found", "path": path})
             except Exception as exc:  # noqa: BLE001
                 return self._send(400, {"error": str(exc)})
@@ -143,6 +181,76 @@ def _make_handler(facade):
                     return self._send(200, facade.jobs.receipt(path.split("/")[2]))
                 if path.startswith("/jobs/") and path.endswith("/export"):
                     return self._send(200, facade.jobs.export_onchain(path.split("/")[2]))
+                if path == "/pool/create":
+                    return self._send(200, facade.pool.create(
+                        body["base_model"], body["dataset"],
+                        method=body.get("method", "lora"), name=body.get("name"),
+                        num_shards=body.get("num_shards", 4),
+                        hyperparameters=body.get("hyperparameters"),
+                        reward_split=body.get("reward_split"),
+                        eval_gate=body.get("eval_gate"),
+                        requester=body.get("requester"),
+                        model_id=body.get("model_id"),
+                        auto_promote=body.get("auto_promote", True)))
+                if path == "/pool/fund/quote":
+                    return self._send(200, facade.pool.fund_quote(
+                        body["pool_id"], body["reward_anm"],
+                        requester=body.get("requester")))
+                if path == "/pool/fund/confirm":
+                    return self._send(200, facade.pool.fund_confirm(
+                        body["pool_id"], body["txid"],
+                        requester=body.get("requester")))
+                if path == "/pool/claim":
+                    claimed = facade.pool.claim_shard(body["pool_id"], body["worker_id"])
+                    return self._send(200, {"claimed": claimed})
+                if path == "/pool/submit":
+                    return self._send(200, facade.pool.submit_shard(
+                        body["pool_id"], body["shard_id"],
+                        worker_id=body.get("worker_id"), run_id=body.get("run_id"),
+                        checkpoint_path=body.get("checkpoint_path"),
+                        metrics=body.get("metrics"),
+                        miner_address=body.get("miner_address")))
+                if path == "/pool/checkpoint/upload":
+                    return self._send(200, facade.pool.store_checkpoint_upload(
+                        body["pool_id"], body["shard_id"], body["content_b64"]))
+                if path == "/pool/served":
+                    return self._send(200, facade.pool.record_served(
+                        body["pool_id"], body["worker_id"], int(body.get("tokens") or 0),
+                        address=body.get("address"), run_id=body.get("run_id"),
+                        latency_ms=body.get("latency_ms"),
+                        served_round=body.get("served_round")))
+                if path == "/pool/tools/propose":
+                    return self._send(200, facade.tools.propose(
+                        body["name"], body.get("description", ""),
+                        body.get("parameters") or {}, body["handler_code"],
+                        proposer=body.get("proposer")))
+                if path in ("/pool/tools/approve", "/pool/tools/reject"):
+                    try:
+                        if path.endswith("approve"):
+                            res = facade.tools.approve(
+                                body["name"], approver=body.get("approver", "admin"),
+                                admin_token=body.get("admin_token", ""))
+                        else:
+                            res = facade.tools.reject(
+                                body["name"], reason=body.get("reason", ""),
+                                admin_token=body.get("admin_token", ""))
+                        return self._send(200, res)
+                    except PermissionError as exc:
+                        return self._send(403, {"error": str(exc)})
+                if path == "/pool/heartbeat":
+                    return self._send(200, facade.pool.heartbeat(
+                        body["pool_id"], body["worker_id"]))
+                if path == "/pool/release":
+                    return self._send(200, facade.pool.release_shard(
+                        body["pool_id"], body["shard_id"],
+                        worker_id=body.get("worker_id")))
+                if path == "/pool/aggregate":
+                    return self._send(200, facade.pool.aggregate(
+                        body["pool_id"], eval_score=body.get("eval_score"),
+                        min_submitted=body.get("min_submitted")))
+                if path == "/pool/payout":
+                    return self._send(200, facade.pool.payout(
+                        body["pool_id"], round=body.get("round")))
                 return self._send(404, {"error": "not found", "path": path})
             except KeyError as exc:
                 return self._send(400, {"error": f"missing field: {exc}"})
