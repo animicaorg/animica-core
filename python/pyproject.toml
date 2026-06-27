@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "animica"
-version = "4.2.1"
-description = "Animica blockchain CLI and client libraries — node, wallet, miner, contracts, and useful-work jobs."
+version = "4.2.2"
+description = "Animica blockchain CLI and client libraries — node, wallet, miner, contracts, useful-work jobs, and Animica Studio serverless compute."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
@@ -57,6 +57,13 @@ dependencies = [
   "safetensors>=0.4.0",
   "scipy>=1.11.0",
   "einops>=0.7.0",
+  # Native SHA3-256 CPU-miner fast path — shipped BY DEFAULT so `pip install
+  # animica` + `animica up` (and the miner archives) get native hashrate with no
+  # extra step. Its build is tolerant: on a platform with no prebuilt wheel and
+  # no C compiler it installs a pure-Python no-op (available()==False) and the
+  # miner falls back, so this can never break the install. Prebuilt wheels:
+  # Linux on PyPI; Windows/macOS via the fastpow-wheels CI (Trusted Publishing).
+  "animica-fastpow>=1.0.1",
 ]
 
 [project.scripts]
@@ -72,6 +79,15 @@ stratum = [
   "fastapi>=0.115.0,<0.116.0",
   "uvicorn[standard]>=0.30.0,<1.0.0",
   "prometheus-client>=0.20.0,<1.0.0",
+]
+# Native CPU-miner fast path (real multi-core hashrate). OPT-IN and isolated:
+# kept out of `all`/`stratum` so a missing platform wheel can never break a plain
+# `pip install animica[all]`. It needs a prebuilt animica-fastpow wheel for the
+# platform (Linux on PyPI; Windows/macOS via the fastpow-wheels CI) or a C
+# compiler to build the sdist. The miner imports it if present and otherwise
+# falls back to the pure-Python loop, so this is purely an accelerator.
+fast = [
+  "animica-fastpow>=1.0.0",
 ]
 wallet_qt = [
   "segno>=1.6.1,<2.0.0",
@@ -101,8 +117,26 @@ bridge = [
 # so `pip install animica` is already GPU-ready. This extra is kept as a no-op
 # alias so existing `animica[gpu]` / `animica[all]` installs keep resolving.
 gpu = []
+# Animica Studio (serverless compute) extras: cloudpickle enables pickle-mode
+# serialization (closures/lambdas); omni-sdk enables on-chain ANM escrow for
+# remote runs. The SDK itself works without these (ref+JSON serialization,
+# local mode), so they're optional.
+studio = [
+  "cloudpickle>=3.0.0",
+  "omni-sdk>=0.1.0",
+]
+# EVM execution lane (ANIMICA_EVM_EXECUTION=1): embeds py-evm so real Solidity
+# contracts deploy and run on a node-local EVM sequencer (chain id 149). Optional;
+# if absent the lane stays disabled and the rest of the EVM facade is unaffected.
+# The native-ANM ERC-20 read facade needs no extra deps.
+evm = [
+  "py-evm>=0.10.1b1",
+]
+# NOTE: `fast` (native miner) is intentionally NOT in `all` — it requires a
+# platform-specific native wheel and must never break a plain `animica[all]`
+# install. Add it explicitly: `pip install "animica[all,fast]"`.
 all = [
-  "animica[backend,stratum,wallet_qt,operator,bridge,gpu]",
+  "animica[backend,stratum,wallet_qt,operator,bridge,gpu,studio]",
 ]
 
 [project.urls]

@@ -5182,6 +5182,29 @@ class P2PService:
     ) -> None:
         if not self._peers:
             return
+        # At the tip => not a stall. When no sync target is set (no peer is
+        # strictly ahead of our head — see _select_sync_target_tip's
+        # heaviest-chain guard), "head not advancing" just means we're waiting
+        # for the next block, not that sync is stuck. Escalating watchdog
+        # recovery here spins forever on a node that is correctly at the tip of
+        # the heaviest chain it can see (e.g. after its DB was restored above
+        # the network's diverged fork) and churns sync state every cycle, which
+        # blocks normal block production. Treat it as progress and stand down.
+        # Only stand down if no CONNECTED peer is actually ahead. target_tip can
+        # be None because the sole ahead peer was penalized out of the candidate
+        # set (consensus_mismatch/headers_timeout backoff); in that case we are
+        # NOT at the tip and must keep escalating recovery to re-engage it.
+        # _max_peer_head_height still counts ahead-but-filtered peers.
+        if (
+            getattr(self, "_sync_target_tip", None) is None
+            and self._max_peer_head_height(now=now) <= head_height
+        ):
+            self._sync_watchdog_last_height = head_height
+            self._sync_watchdog_last_hash = head_hash
+            self._sync_watchdog_last_progress_at = now
+            self._sync_watchdog_last_action_at = 0.0
+            self._sync_watchdog_attempts = 0
+            return
         if head_height > self._sync_watchdog_last_height or (
             head_hash and head_hash != self._sync_watchdog_last_hash
         ):
@@ -5844,6 +5867,29 @@ class P2PService:
                 best_hash = head_hash
         return best_peer, best_height, best_hash
 
+    def _max_peer_head_height(self, *, now: Optional[float] = None) -> int:
+        """Highest fresh head height reported by ANY connected (hello-done) peer,
+        IGNORING sync-eligibility.
+
+        Unlike _best_peer_head (which skips peers that are penalized / in sync
+        backoff / cooldown), this still counts a peer that is currently ahead but
+        temporarily filtered out. The at-tip => SYNCED transition and the sync
+        watchdog stand-down both key off "no sync target", which becomes None
+        both when no peer is ahead (genuinely at tip) AND when the only ahead
+        peer was just penalized out of the candidate set (we are far behind).
+        This lets those call sites tell the two apart so a behind node does not
+        falsely declare itself synced.
+        """
+        now = time.time() if now is None else now
+        best = 0
+        for peer in self._peers.values():
+            if not peer.hello_done.is_set():
+                continue
+            height, _head_hash = self._fresh_peer_head(peer, now=now)
+            if height > best:
+                best = height
+        return best
+
     def _fresh_peer_head(
         self, peer: _PeerState, *, now: Optional[float] = None
     ) -> tuple[int, Optional[bytes]]:
@@ -5975,6 +6021,20 @@ class P2PService:
             if cand_score > best_score:
                 best = candidate
                 continue
+        # Heaviest-chain guard: a sync target must be strictly AHEAD of our own
+        # head. A peer on a shorter/lighter fork — e.g. after this node's chain
+        # was restored to a height ABOVE the network's diverged fork — must never
+        # become a sync target. Otherwise the sync driver loops forever on
+        # "Sync target hash mismatch" trying to reorg backward to a lighter
+        # chain, freezing the head (the exact "chain reset" stall). Such a peer
+        # should reorg up to us; the bulk sync driver only ever pulls us forward.
+        if best is not None:
+            try:
+                local_height, _ = self._local_head()
+                if local_height is not None and int(best.height) <= int(local_height):
+                    return None
+            except Exception:
+                pass
         return best
 
     def _update_sync_target_tip(self, now: float) -> Optional[_SyncTargetTip]:
@@ -10053,6 +10113,17 @@ class P2PService:
                 best_header_height = max(best_header_height, int(target_height))
             if best_header_height > local_height_int:
                 expected_next_height = local_height_int + 1
+                # Fork recovery: if the peer's header chain diverged from ours
+                # BELOW our head (matched ancestor < local head), we followed/mined
+                # a losing branch. Requesting local_head+1 only ever yields an
+                # orphan — its parent is the peer's block at our head's height,
+                # which we don't have — so the node wedges at its fork tip forever
+                # (the classic "stuck at the block I mined" after solo mining).
+                # Instead, fetch the competing branch from the fork point so we
+                # build the heavier side-chain and the fork choice reorgs onto it.
+                anc = self._sync_last_matched_ancestor_height
+                if anc is not None and int(anc) < local_height_int:
+                    expected_next_height = int(anc) + 1
                 next_hash = next(
                     (
                         h
@@ -12599,6 +12670,31 @@ class P2PService:
                     self._sync_last_queue_depth = current_queue_depth
                 best_peer, best_peer_height, best_peer_hash = self._best_peer_head()
                 target_tip = self._update_sync_target_tip(now)
+                # At-tip => SYNCED. When no target is ahead of us (the
+                # heaviest-chain guard in _select_sync_target_tip cleared it)
+                # and there's no pending block work, we are at the tip of the
+                # best chain we can see. Declare SYNCED so the miner/template
+                # path runs and block production resumes — otherwise a node
+                # whose only peers are behind/foreign (e.g. after its DB was
+                # restored above the network's diverged fork) stays pinned in
+                # HEADERS forever and never produces a block.
+                # Guard: only declare SYNCED when no CONNECTED peer is strictly
+                # ahead of us. target_tip goes None both when we are genuinely at
+                # the tip AND when the only ahead peer was penalized out of the
+                # sync-candidate set (consensus_mismatch/headers_timeout backoff).
+                # Without this check a node far behind a known-but-filtered peer
+                # latches SYNCED and stops syncing — the 1.9.13 "stuck behind"
+                # regression. _max_peer_head_height counts ahead-but-filtered
+                # peers, so it stays > our head until we actually catch up.
+                if (
+                    target_tip is None
+                    and best_block_height > 0
+                    and self._max_peer_head_height(now=now) <= best_block_height
+                    and not self._sync_block_queue
+                    and not self._sync_inflight_blocks
+                    and self._sync_phase not in ("SYNCED", "IDLE")
+                ):
+                    self._sync_phase = "SYNCED"
                 log.debug(
                     "Sync loop tick",
                     extra={
@@ -14459,6 +14555,18 @@ class P2PService:
                 continue
             if self._enforce_outbound_only_policy_for_peer(peer):
                 continue
+            # Only count peers PROVEN to serve valid headers on OUR chain. A
+            # different-genesis / dead-fork peer runs ahead on its own branch and
+            # even passes the (optimistic) anchored check, but it never serves us a
+            # valid header (genesis_mismatch at sync), so successful_headers_served
+            # stays 0. Excluding such peers stops the phantom (e.g. 25718) from
+            # poisoning net_best — which otherwise makes the node believe it is
+            # behind, wedge, and (via the mining gate) halt mining while it is
+            # actually AT the canonical tip. If no proven peer is ahead, net_best
+            # is None and the node treats itself as at-tip (mining allowed).
+            bc = getattr(peer, "broadcast", None)
+            if bc is None or int(getattr(bc, "successful_headers_served", 0)) <= 0:
+                continue
             info = self._sync_peer_heads.get(peer.remote)
 
             # Check if peer is responsive (not stale and not in cooldown)
@@ -14472,22 +14580,14 @@ class P2PService:
                 
                 # Add peer's direct height
                 heights.append(peer_height)
-
-                # Only accept network_best_height from responsive peers
-                # This prevents stalled high-height nodes from blocking reorg to active chains
-                try:
-                    # Add peer's view of network best height (peers-of-peers)
-                    network_height = (peer.hello or {}).get("network_best_height")
-                    if network_height is not None:
-                        network_height = int(network_height)
-                        if network_height > 0:
-                            heights.append(network_height)
-                except Exception:
-                    continue
+                # NOTE: peers-of-peers network_best_height views are intentionally
+                # NOT counted — they propagate a dead fork's height even through
+                # anchored peers, re-poisoning net_best. Direct heights from
+                # anchored (same-chain) peers are authoritative for our tip.
         
         if not heights:
             return None
-        
+
         # Apply verifier seed constraint if enabled and verifier seeds are present
         if self._enable_verifier_seeds and verifier_heights:
             max_verifier_height = max(verifier_heights)
@@ -14521,7 +14621,7 @@ class P2PService:
             else:
                 # If all heights are filtered out, fall back to verifier max + 1.
                 return max_verifier_height + 1
-        
+
         # No verifier constraint, return max height
         return max(heights)
 

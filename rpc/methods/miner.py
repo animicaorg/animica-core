@@ -1464,7 +1464,28 @@ def _mining_gate(
             },
         )
         return False, f"too_far_behind:{header_lag}_blocks"
-    
+
+    # Network-tip lag: best_header_height can read "at tip" while the node is
+    # actually wedged N blocks short of the real network tip (the near-tip sync
+    # wedge), so ALSO gate on network_best_height (the peers' height). Without
+    # this, a behind seed hands out stale templates that orphan when it catches
+    # up — wasting miners' hashpower mining against an unsynced node. A small
+    # tolerance absorbs propagation jitter / being the block producer; the
+    # allow_unsynced override still works for intentional offline/test mining.
+    network_best = int(sync_status.get("network_best_height") or 0)
+    net_lag = network_best - exec_head
+    net_lag_limit = int(os.getenv("ANIMICA_MINING_MAX_NETWORK_LAG", "16"))
+    if network_best > 0 and net_lag >= net_lag_limit and not allow_unsynced:
+        log.info(
+            "MINER_BEHIND_NETWORK",
+            extra={
+                "exec_head": exec_head,
+                "network_best": network_best,
+                "net_lag": net_lag,
+            },
+        )
+        return False, f"behind_network:{net_lag}_blocks"
+
     # Check execution lag: if exec_head is too far behind best known headers,
     # we may be in "headers-only" mode (headers synced but blocks not executed yet)
     max_lag = int(os.getenv("ANIMICA_MINING_MAX_LAG", "10"))  # Increased default from 2 to 10
@@ -6735,9 +6756,18 @@ def miner_submit_block(payload: Any = None, **kwargs: Any) -> Dict[str, Any]:
                 credited_amount = int(expected_reward)
                 credited_source = "expected_reward"
 
-            # AICF Credit Minting: Mint credits from block reward + fees
-            # This happens AFTER block is committed and rewards are applied to state
+            # AICF Credit Minting: Mint credits from block reward + fees.
+            # Gate on head_changed so credits are minted only when this block actually
+            # advanced the canonical head. A fork-choice desync could leave a block
+            # ACCEPTED-but-non-canonical (head frozen); the old code minted on every
+            # such retry, inflating AICF credits for the same height. The root-cause
+            # fix lives in block_import._apply_fork_choice (self-heal); this is
+            # defense in depth so a stalled head can never mint duplicate credits.
+            class _AicfMintSkipped(Exception):
+                pass
             try:
+                if not result.head_changed:
+                    raise _AicfMintSkipped()
                 from aicf.protocol.state import ProtocolState
                 from aicf.credits.minting import mint_block_credits, get_aicf_slice_bps
                 
@@ -6786,6 +6816,12 @@ def miner_submit_block(payload: Any = None, **kwargs: Any) -> Dict[str, Any]:
                     f"aicf_credits={mint_result['aicf_credits']}, "
                     f"ledger_id={mint_result['ledger_id']}"
                 )
+            except _AicfMintSkipped:
+                log.debug(
+                    "Skipped AICF mint for non-canonical block height=%s "
+                    "(head did not advance)",
+                    result.height,
+                )
             except Exception as e:
                 # Don't fail block submission if credit minting has issues
                 # Credit minting is tracked separately and can be reconciled later
@@ -6798,7 +6834,11 @@ def miner_submit_block(payload: Any = None, **kwargs: Any) -> Dict[str, Any]:
         head_after_height = int(head_after.get("height") or 0)
         committed_height = int(result.height or 0)
         new_head_height = head_after_height
-        if committed_height > new_head_height:
+        # Only claim the submitted height as the new head if the import actually
+        # advanced the canonical head. Previously this overrode unconditionally, so a
+        # stalled head still reported new_head=committed_height — telling miners to move
+        # on while the chain was frozen, a self-reinforcing resubmit loop.
+        if result.head_changed and committed_height > new_head_height:
             new_head_height = committed_height
 
         new_head_hash = head_after.get("hash")

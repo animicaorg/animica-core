@@ -414,21 +414,32 @@ def create_app(cfg: rpc_config.Config | None = None) -> FastAPI:
     _mount_metrics(app)
 
     # --- Bitcoin-Core-compat: JSON-RPC at root "/" (bitcoin-cli & friends POST to /) ---
+    # Reuses the exact same dispatcher as /rpc, so Bitcoin-shaped methods
+    # (getblockcount, getblock, sendrawtransaction, ...) work for clients that
+    # post to root. GET "/" remains the banner below (FastAPI routes by method).
     @app.post("/")
     async def root_rpc_endpoint(request: Request) -> Response:
         try:
             payload = await request.json()
         except Exception as e:
             err = rpc_errors.ParseError(f"Invalid JSON body: {e}")  # type: ignore[misc]
-            return JSONResponse({"jsonrpc": "2.0", "id": None, "error": err.to_dict()}, status_code=200)
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": None, "error": err.to_dict()}, status_code=200
+            )
         try:
             result = await _call_dispatch(payload, request)
         except rpc_errors.RpcError as re:  # type: ignore[attr-defined]
             rpc_id = payload.get("id") if isinstance(payload, dict) else None
-            return JSONResponse({"jsonrpc": "2.0", "id": rpc_id, "error": re.to_dict()}, status_code=200)
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": rpc_id, "error": re.to_dict()}, status_code=200
+            )
         except Exception as e:
             log.exception("Unhandled error in JSON-RPC (root)")
-            return JSONResponse({"jsonrpc": "2.0", "error": {"code": -32603, "message": "Internal error", "data": str(e)}, "id": payload.get("id") if isinstance(payload, dict) else None}, status_code=200)
+            return JSONResponse(
+                {"jsonrpc": "2.0", "error": {"code": -32603, "message": "Internal error",
+                 "data": str(e)}, "id": payload.get("id") if isinstance(payload, dict) else None},
+                status_code=200,
+            )
         if result is None:
             return Response(status_code=204)
         if isinstance(result, (dict, list)):
@@ -485,6 +496,18 @@ def main() -> None:
         cfg.port,
         extra={"host": cfg.host, "port": cfg.port, "ping": "node.ping"},
     )
+
+    # Optional node auto-updater (off unless ANIMICA_AUTOUPDATE is set). Keeps a
+    # node on the latest published release so fixes (e.g. the chain-reset
+    # self-heal) propagate as operators' nodes pick them up. Guarded so it is
+    # harmless when the module isn't present in an older installed package.
+    try:
+        from animica.autoupdate import start as _start_autoupdate
+
+        _start_autoupdate()
+    except Exception as exc:  # never block node boot on the updater
+        log.debug("autoupdate not started: %s", exc)
+
     uvicorn.run(
         app,
         host=cfg.host,
