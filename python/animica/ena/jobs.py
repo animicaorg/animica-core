@@ -31,7 +31,15 @@ from .models import (
 JOB_TYPES = (
     "scrape", "extract", "chunk", "label", "embed", "index", "summarize",
     "eval", "dataset_clean", "training_records", "train_prepare",
+    "synthesize_qa",
 )
+
+# Job types whose executor calls a generative model and therefore MUST run on
+# the WORKER's local runtime (LOCAL_INFERENCE_URL), never on the coordinator in
+# its request path. The coordinator refuses to execute these in ``run`` unless
+# the caller is the worker-local path (``allow_worker_local=True``); workers
+# detect membership here and self-route to local execution + ``submit_result``.
+WORKER_LOCAL_JOB_TYPES = frozenset({"synthesize_qa"})
 
 # Lifecycle states (docs/ena/useful-work-jobs.md).
 STATUS_PROPOSED = "proposed"
@@ -118,9 +126,18 @@ class JobService:
 
     # -- run --------------------------------------------------------------
     def run(self, job_id: Optional[str] = None, *, worker_id: Optional[str] = None,
-            job_types: Optional[list[str]] = None) -> dict[str, Any]:
+            job_types: Optional[list[str]] = None,
+            allow_worker_local: bool = False) -> dict[str, Any]:
         """Execute a job locally. With ``worker_id`` and no ``job_id``, claims
-        the next eligible ``proposed`` job first."""
+        the next eligible ``proposed`` job first.
+
+        Worker-local job types (e.g. ``synthesize_qa``) call a generative model
+        and must run on the worker, not on the coordinator in-request. This
+        method refuses to execute them unless ``allow_worker_local=True`` (set
+        only by the worker's local-exec path), so the coordinator's
+        ``POST /jobs/<id>/run`` route can never peg its own model. The worker
+        runs them locally and returns the result via ``submit_result``.
+        """
         if job_id is None:
             if not worker_id:
                 raise JobError("run needs either a job_id or a worker_id to claim")
@@ -131,6 +148,11 @@ class JobService:
             job = self.get(job_id)
             if job["status"] in (STATUS_PROPOSED,) and worker_id:
                 job["worker_id"] = worker_id
+        if job["job_type"] in WORKER_LOCAL_JOB_TYPES and not allow_worker_local:
+            raise JobError(
+                f"{job['job_type']} is worker-local: execute it on the worker's "
+                f"own model and return results via POST /jobs/{job['job_id']}/submit-result",
+                hint="upgrade the worker fleet to animica>=5.1.0 before emitting this job type")
         job["status"] = STATUS_RUNNING
         job["updated_at"] = now_ts()
         if worker_id:
@@ -145,7 +167,15 @@ class JobService:
             raise JobError(job["error"])
         try:
             result, artifacts = executor(self, job, job["params"])
-        except JobError:
+        except JobError as exc:
+            # An executor JobError (e.g. an SSRF/policy refusal raised by the
+            # hardened scrape executor) is a clean terminal REJECT, not a stuck
+            # 'running' job. Persist the rejected status + reason BEFORE re-raising
+            # so the queue never leaks a job pinned at STATUS_RUNNING. (graft 1)
+            job["status"] = STATUS_REJECTED
+            job["error"] = getattr(exc, "message", str(exc))
+            job["updated_at"] = now_ts()
+            self.store.upsert_job(job)
             raise
         except Exception as exc:  # noqa: BLE001
             job["status"] = STATUS_REJECTED
@@ -160,6 +190,24 @@ class JobService:
         job["updated_at"] = now_ts()
         self.store.upsert_job(job)
         return job
+
+    def _maybe_stage(self, job: dict[str, Any]) -> None:
+        """Curate a worker-local job's synthesized pairs into STAGING.
+
+        Invoked from the result-landing path (``submit_result``) so synthesized
+        pairs are curated identically whether they arrive from a remote fleet
+        worker or a single-box worker (which finalizes via ``submit_result``
+        too). Deterministic + model-free; never raises (a curation failure must
+        not fail the job). Staging is safe — the live genome is only grown by the
+        explicit, bounded :func:`curation.promote_staging`.
+        """
+        if job.get("job_type") not in WORKER_LOCAL_JOB_TYPES:
+            return
+        try:
+            from . import curation
+            job["curation"] = curation.stage_submission(self.cfg, job)
+        except Exception as exc:  # noqa: BLE001
+            job["curation"] = {"error": str(exc)}
 
     def submit(self, job_id: str, result_path: str) -> dict[str, Any]:
         job = self.get(job_id)
@@ -178,6 +226,32 @@ class JobService:
         job["artifacts"] = (job.get("artifacts") or []) + [art]
         job["status"] = STATUS_SUBMITTED
         job["updated_at"] = now_ts()
+        self.store.upsert_job(job)
+        return job
+
+    def submit_result(self, job_id: str, result: Optional[dict[str, Any]] = None,
+                      worker_id: Optional[str] = None) -> dict[str, Any]:
+        """Attach an **inline** result a worker computed locally (no file).
+
+        This is the fast coordinator-side landing for worker-local jobs: the
+        worker ran the model on its own hardware and POSTs the JSON result here,
+        so the coordinator never executes the model and the worker never holds an
+        HTTP read open across a long generation. For synthesis jobs the gated
+        pairs are immediately curated into the STAGING dataset (model-free); the
+        live genome is only grown by an explicit, bounded promote step.
+        """
+        job = self.get(job_id)
+        result = result or {}
+        if worker_id:
+            job["worker_id"] = worker_id
+        art = self._write_artifact(job_id, "submitted_result.json",
+                                   canonical_json(result))
+        job["result"] = result
+        job["result_hash"] = hash_obj(result)
+        job["artifacts"] = (job.get("artifacts") or []) + [art]
+        job["status"] = STATUS_SUBMITTED
+        job["updated_at"] = now_ts()
+        self._maybe_stage(job)  # curate synthesized pairs into STAGING (model-free)
         self.store.upsert_job(job)
         return job
 
@@ -252,20 +326,33 @@ def _exec_extract(self: JobService, job, params):
 
 
 def _exec_scrape(self: JobService, job, params):
+    """Fetch one URL into normalized raw text — through the 5.1.1 SSRF guard.
+
+    Routes the fetch through :func:`animica.ena.web.fetch`, so the hostname is
+    resolved + every IP validated against the private/reserved ranges, the
+    connection is pinned to the validated IP (DNS-rebind defense), redirects are
+    re-validated per hop, and the body is size-capped + content-type-allowlisted.
+    The result is corpus SOURCE only (it still has to pass synthesis + the
+    curation gate before anything can reach the genome).
+    """
+    from . import web
     url = params.get("source") or params.get("url")
     if not url:
         raise JobError("scrape requires --source/--url")
-    import urllib.request
-    req = urllib.request.Request(url, headers={"user-agent": self.cfg.network.user_agent})
-    with urllib.request.urlopen(req, timeout=self.cfg.network.request_timeout_seconds) as resp:
-        body = resp.read().decode("utf-8", "replace")
-    rec = {"url": url, "text": body}
+    try:
+        res = web.fetch(url, self.cfg.network)
+    except web.WebFetchError as exc:
+        raise JobError(exc.message, hint=exc.hint) from exc
+    rec = {"url": res.final_url, "text": res.text}
     art_path = self._artifacts_dir(job["job_id"]) / "raw.jsonl"
     ds.write_jsonl(art_path, [rec])
     art = {"artifact_id": "art-" + new_uuid()[:16], "path": str(art_path),
            "name": "raw.jsonl", "hash": ds.sha256_file(art_path)}
-    return ({"url": url, "bytes": len(body), "rows": 1,
-             "provenance": {"url": url}}, [art])
+    return ({"url": res.final_url, "bytes": res.raw_bytes, "chars": len(res.text),
+             "rows": 1, "content_type": res.content_type, "ip": res.ip,
+             "hops": res.hops,
+             "provenance": {"url": res.final_url, "requested_url": url,
+                            "ip": res.ip, "content_type": res.content_type}}, [art])
 
 
 def _exec_chunk(self: JobService, job, params):
@@ -420,6 +507,38 @@ def _exec_train_prepare(self: JobService, job, params):
     return ({"dataset": dataset, "manifest": manifest}, [art])
 
 
+def _exec_synthesize_qa(self: JobService, job, params):
+    """Worker-local LLM synthesis: corpus chunk -> ``{prompt, response}`` pairs.
+
+    Runs the worker's OWN model (``self.model`` resolves to LOCAL_INFERENCE_URL
+    on a worker) over the inline ``params['corpus']``; it must only be reached
+    via the worker's local-exec path (``run(..., allow_worker_local=True)`` or
+    the worker calling :func:`animica.ena.synth.synthesize` directly), never the
+    coordinator's in-request ``/run``. Best-effort: a weak local model yields
+    zero pairs but the job still completes so the miner earns for the attempt.
+    """
+    from . import synth
+    corpus = params.get("corpus") or params.get("source_chunk")
+    if not corpus:
+        raise JobError("synthesize_qa requires --corpus (inline source chunk)")
+    model = self.model(params.get("model_provider"))
+    pairs, meta = synth.synthesize(
+        model, str(corpus),
+        num_pairs=int(params.get("num_pairs", synth.DEFAULT_NUM_PAIRS)),
+        max_tokens=int(params.get("max_tokens", synth.DEFAULT_MAX_TOKENS)),
+        temperature=float(params.get("temperature", synth.DEFAULT_TEMPERATURE)),
+        # synthesize UNDER the round the coordinator stamped on the job (or env);
+        # the miner's generation is then driven by verifiable quantum entropy.
+        beacon=params.get("quantum_beacon"),
+        bind_id=job.get("job_id"))
+    out_path = self._artifacts_dir(job["job_id"]) / "pairs.jsonl"
+    ds.write_jsonl(out_path, pairs)
+    art = {"artifact_id": "art-" + new_uuid()[:16], "path": str(out_path),
+           "name": "pairs.jsonl", "hash": ds.sha256_file(out_path)}
+    result = {"pairs": pairs, "pair_count": len(pairs), **meta}
+    return (result, [art])
+
+
 _EXECUTORS: dict[str, Callable] = {
     "extract": _exec_extract,
     "scrape": _exec_scrape,
@@ -432,6 +551,7 @@ _EXECUTORS: dict[str, Callable] = {
     "training_records": _exec_training_records,
     "eval": _exec_eval,
     "train_prepare": _exec_train_prepare,
+    "synthesize_qa": _exec_synthesize_qa,
 }
 
 
@@ -475,4 +595,11 @@ def _verify_checks(job) -> list[dict[str, Any]]:
     if jt == "train_prepare":
         man = result.get("manifest") or {}
         add("manifest_shape", all(k in man for k in ("run_name", "backend", "base_model")))
+    if jt == "synthesize_qa":
+        # Permissive: attests the work ran and is well-shaped. Genome growth is
+        # gated separately (curation), so a sparse chunk yielding 0 pairs is a
+        # valid, paid useful-work result — it just won't grow the genome.
+        add("pairs_is_list", isinstance(result.get("pairs"), list),
+            result.get("pair_count"))
+        add("has_provenance", bool(result.get("provenance")))
     return checks

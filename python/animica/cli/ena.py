@@ -166,6 +166,68 @@ app.add_typer(agent_app, name="agent")
 agent_app.command("run")(run_task)
 
 
+# -- qDNA: the Quantum-Sealed Genome Ledger ---------------------------------
+genome_app = typer.Typer(
+    help="qDNA — the quantum-sealed, Merkle-anchored genome ledger (verifiable AI lineage).",
+    no_args_is_help=True)
+app.add_typer(genome_app, name="genome")
+
+
+def _genome_ledger(pool: Optional[str], genome_path: Optional[str]):
+    from animica.ena import genome as _g
+    if genome_path:
+        return _g.GenomeLedger.for_genome(genome_path)
+    if pool:
+        rec = _ena().pool.get(pool)
+        return _g.GenomeLedger.for_genome(rec["dataset_path"])
+    raise typer.BadParameter("provide --pool <id> or --genome <dataset.jsonl>")
+
+
+@genome_app.command("root")
+def genome_root(pool: Optional[str] = typer.Option(None, "--pool"),
+                genome_path: Optional[str] = typer.Option(None, "--genome")):
+    """Current genome_root / epoch / gene count (the head of the lineage)."""
+    head = _genome_ledger(pool, genome_path).head()
+    typer.echo(_json.dumps(head or {"epoch": -1, "genome_root": "00" * 32,
+                                    "gene_count": 0, "note": "empty ledger"}, indent=2))
+
+
+@genome_app.command("verify")
+def genome_verify(pool: Optional[str] = typer.Option(None, "--pool"),
+                  genome_path: Optional[str] = typer.Option(None, "--genome")):
+    """Audit the whole ledger: every gene seal + Merkle root + chain. Exit 0/1."""
+    v = _genome_ledger(pool, genome_path).verify()
+    typer.echo(_json.dumps(v, indent=2))
+    raise typer.Exit(0 if v.get("valid") else 1)
+
+
+@genome_app.command("gene")
+def genome_gene(gene_id: str = typer.Argument(...),
+                pool: Optional[str] = typer.Option(None, "--pool"),
+                genome_path: Optional[str] = typer.Option(None, "--genome")):
+    """Show a gene's sealed record + provenance + parents."""
+    g = _genome_ledger(pool, genome_path).get_gene(gene_id)
+    if not g:
+        typer.echo(f"gene not found: {gene_id}"); raise typer.Exit(1)
+    typer.echo(_json.dumps(g, indent=2))
+
+
+@genome_app.command("lineage")
+def genome_lineage(gene_id: str = typer.Argument(...),
+                   pool: Optional[str] = typer.Option(None, "--pool"),
+                   genome_path: Optional[str] = typer.Option(None, "--genome")):
+    """Trace a gene back through its parents to the founders."""
+    typer.echo(_json.dumps(_genome_ledger(pool, genome_path).lineage(gene_id), indent=2))
+
+
+@genome_app.command("anchor")
+def genome_anchor(pool: Optional[str] = typer.Option(None, "--pool"),
+                  genome_path: Optional[str] = typer.Option(None, "--genome")):
+    """Emit the chain-ready commitment of the current head (off-chain JSON)."""
+    env = _genome_ledger(pool, genome_path).anchor_envelope()
+    typer.echo(_json.dumps(env or {"note": "empty ledger"}, indent=2))
+
+
 @app.command("chat")
 def chat(repo: Optional[str] = typer.Option(None, "--repo"),
          model_provider: Optional[str] = typer.Option(None, "--model-provider"),
@@ -608,6 +670,28 @@ def pool_payout(pool_id: str = typer.Argument(..., help="pool id"),
     _emit(_guard(_ena().pool.payout, pool_id, round=round), title="payout")
 
 
+@app.command("promote-staging")
+def promote_staging(pool: str = typer.Option(..., "--pool", help="pool id"),
+                    max_rows: int = typer.Option(200, "--max-rows",
+                        help="cap rows promoted into the live genome this cycle"),
+                    dry_run: bool = typer.Option(False, "--dry-run",
+                        help="preview only — gate + dedupe + validate, write nothing")):
+    """Grow a pool's LIVE training genome from curated worker-synthesized STAGING.
+
+    The explicit, gated step of the synthesis flywheel: miners run synthesize_qa
+    on their OWN model and submit {prompt,response} pairs; the coordinator curates
+    them into STAGING (schema + length + groundedness gate + content-hash dedupe).
+    This promotes a bounded, re-validated, genome-deduped batch into the pool's
+    dataset_path (snapshotting a .bak first) and updates dataset_sha256 /
+    dataset_rows while keeping dataset_id stable. Manual by default; a periodic
+    gated cron MAY call it so STAGING does not grow unbounded. NOTE: this grows
+    the training DATA — weight updates still require the GPU pool train-loop
+    reading the grown dataset each round.
+    """
+    _emit(_guard(_ena().pool.promote_genome, pool, max_rows=max_rows,
+                 dry_run=dry_run), title="promote-staging")
+
+
 @pool_app.command("train-loop")
 def pool_train_loop(pool_id: str = typer.Argument(..., help="pool id"),
                     worker_id: str = typer.Option(..., "--worker-id"),
@@ -809,6 +893,122 @@ def scrape(url: str = typer.Argument(...), out: str = typer.Option(..., "--out")
         import shutil
         shutil.copyfile(art["path"], out)
     _emit({"url": url, "out": out, "result": job.get("result")}, title="scrape")
+
+
+# ===========================================================================
+# acquire (5.1.1 SSRF-safe web -> corpus -> synthesize_qa)
+# ===========================================================================
+
+acquire_app = typer.Typer(
+    help="Internet-scale learning (5.1.1): SSRF-safe web fetch -> corpus chunks "
+         "-> INLINE synthesize_qa. Coordinator-side only; web text reaches the "
+         "genome only via synthesis + the curation gate.",
+    no_args_is_help=True)
+app.add_typer(acquire_app, name="acquire")
+
+
+@acquire_app.command("fetch")
+def acquire_fetch(url: str = typer.Argument(..., help="public http(s) URL"),
+                  max_chars: int = typer.Option(1200, "--max-chars"),
+                  show: bool = typer.Option(False, "--show", help="print chunk previews")):
+    """Fetch + extract + chunk a URL through the SSRF guard (preview, no jobs)."""
+    from animica.ena import web
+    e = _ena()
+    try:
+        res, chunks = web.fetch_and_chunk(url, e.cfg.network, max_chars=max_chars)
+    except web.WebFetchError as exc:
+        console.print(f"[red]{exc.render()}[/red]")
+        raise typer.Exit(1)
+    out = {"fetch": res.to_dict(), "chunks": len(chunks)}
+    if _state.json:
+        out["chunk_records"] = chunks
+        return _emit(out)
+    _emit(out, title="acquire fetch")
+    if show:
+        for c in chunks[:5]:
+            console.print(f"[dim]#{c['ordinal']}[/dim] {c['text'][:160]}")
+
+
+@acquire_app.command("feed")
+def acquire_feed(url: str = typer.Argument(..., help="public http(s) URL"),
+                 num_pairs: int = typer.Option(3, "--num-pairs"),
+                 max_chunks: int = typer.Option(8, "--max-chunks",
+                     help="cap synthesize_qa jobs emitted from this page"),
+                 max_chars: int = typer.Option(3000, "--max-chars"),
+                 dedupe: bool = typer.Option(False, "--dedupe/--no-dedupe",
+                     help="skip chunks already shipped (cross-run AcquiredLedger)")):
+    """Fetch a URL (SSRF-guarded) and emit synthesize_qa jobs with INLINE corpus.
+
+    Each emitted job carries one chunk's text in params['corpus']; miners
+    synthesize {prompt,response} pairs on their OWN model, the coordinator gates
+    them into STAGING, and the explicit `ena promote-staging` grows the genome.
+    The web bytes themselves never enter the genome.
+
+    With --dedupe, an AcquiredLedger under the ENA home remembers which corpus
+    chunks were already shipped so re-running this command (or the feeder) does
+    not re-synthesize identical corpus — a pure efficiency/budget win (the
+    curation gate already dedupes the synthesized pairs).
+    """
+    from animica.ena import web
+    e = _ena()
+    try:
+        res, chunks = web.fetch_and_chunk(url, e.cfg.network, max_chars=max_chars)
+    except web.WebFetchError as exc:
+        console.print(f"[red]{exc.render()}[/red]")
+        raise typer.Exit(1)
+    ledger = (web.AcquiredLedger(e.cfg.artifacts_dir() / "acquired_ledger.jsonl")
+              if dedupe else None)
+    emitted: list[dict[str, Any]] = []
+    skipped = 0
+    for c in chunks[:max_chunks]:
+        if ledger is not None and ledger.seen(c["text"]):
+            skipped += 1
+            continue
+        job = _guard(e.jobs.create, "synthesize_qa",
+                     {"corpus": c["text"], "num_pairs": num_pairs,
+                      # provenance (graft 4): URL -> bytes -> round -> gene audit trail
+                      "source": c.get("source", res.final_url),
+                      "content_type": res.content_type,
+                      "source_sha": c.get("source_sha"),
+                      "fetched_at": c.get("fetched_at")})
+        if ledger is not None:  # record only AFTER a successful emit
+            ledger.record(c["text"], c.get("source", res.final_url))
+        emitted.append({"job_id": job["job_id"], "chars": len(c["text"])})
+    _emit({"url": res.final_url, "ip": res.ip, "chunks": len(chunks),
+           "skipped_seen": skipped, "emitted": emitted}, title="acquire feed")
+
+
+@acquire_app.command("check")
+def acquire_check(url: str = typer.Argument(..., help="public http(s) URL to audit")):
+    """Preflight the SSRF policy against a URL — validate + DNS only, no fetch.
+
+    Runs the exact scheme/userinfo/port/domain checks, resolves the host, and
+    runs the per-IP private/reserved guard, then prints {decision, resolved IPs,
+    block reason, pinned ip} WITHOUT fetching a body. An operator audit tool: it
+    opens NO new fetch surface (no body egress) and works even when
+    network.acquire_enabled is false (that flag only gates real fetches).
+    """
+    from animica.ena import web
+    e = _ena()
+    net = e.cfg.network
+    out: dict[str, Any] = {"url": url,
+                           "acquire_enabled": bool(getattr(net, "acquire_enabled", True))}
+    blocked = False
+    try:
+        # Pass the module resolver explicitly so the call uses getaddrinfo at
+        # call time (and stays mockable in tests) rather than a def-time default.
+        target = web.validate_url(url, net, _resolver=web._resolve)
+        out.update(decision="allowed", scheme=target.scheme, host=target.host,
+                   port=target.port, resolved=target.resolved, pinned_ip=target.ip)
+    except web.WebFetchError as exc:
+        blocked = True
+        out["decision"] = "blocked"
+        out["reason"] = exc.message
+        if exc.hint:
+            out["hint"] = exc.hint
+    _emit(out, title="acquire check")
+    if blocked:
+        raise typer.Exit(1)
 
 
 @app.command("stats")

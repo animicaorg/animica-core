@@ -791,6 +791,33 @@ class PoolService:
                 "reason": "eval_below_threshold_advanced", "gate": gate_info,
                 "next_round": pool["round"]}
 
+    def _hold_round_for_adapters(self, pool: dict[str, Any], pool_id: str,
+                                 rnd: int) -> int:
+        """No adapter was uploaded this round (trainers reported scores but never
+        uploaded weights). Hold the round at ``rnd`` — do NOT advance — and reopen
+        its non-adapter shards so a healthy trainer can still upload real weights.
+        Without this the round counter runs away while the served checkpoint is
+        stranded at the last real round (the "stuck on round N for days" bug)."""
+        reopened = 0
+        for s in self.store.list_shards(pool_id, round=rnd):
+            cp = s.get("checkpoint_path")
+            has_adapter = bool(cp) and (Path(cp) / "adapter_model.safetensors").is_file()
+            if s.get("status") in (SHARD_SUBMITTED, SHARD_CLAIMED) and not has_adapter:
+                s.update(status=SHARD_OPEN, worker_id=None, run_id=None,
+                         checkpoint_path=None, updated_at=now_ts())
+                self.store.upsert_shard(s)
+                reopened += 1
+        meta = dict(pool.get("metadata") or {})
+        held = list(meta.get("held_rounds") or [])
+        held.append({"round": rnd, "at": now_ts(),
+                     "reason": "no_adapters_uploaded", "reopened": reopened})
+        meta["held_rounds"] = held[-20:]
+        pool["metadata"] = meta
+        pool["status"] = POOL_STATUS_TRAINING
+        pool["updated_at"] = now_ts()
+        self.store.upsert_pool(pool)
+        return reopened
+
     # -- distributed training artifacts (off-coordinator workers) ---------
     def read_shard_data(self, shard_id: str) -> dict[str, Any]:
         """Return a claimed shard's training rows so a remote trainer (on its own
@@ -1016,6 +1043,19 @@ class PoolService:
                     "method": _method or None,
                     "adapters_uploaded": self._shards_have_adapters(submitted)}
             if auto:
+                # Distinguish "adapters uploaded but all diverged (NaN/inf)" from
+                # "no adapter uploaded at all". Only the former is real-but-bad work
+                # worth rejecting-and-advancing. For the latter, advancing just burns
+                # the round and strands the served checkpoint while the round counter
+                # runs away — the "stuck on round N for days" failure. HOLD instead:
+                # reopen the round's shards so a healthy trainer can upload real
+                # weights, and do NOT advance.
+                if not info["adapters_uploaded"]:
+                    reopened = self._hold_round_for_adapters(pool, pool_id, rnd)
+                    return {"pool_id": pool_id, "round": rnd, "promoted": False,
+                            "reason": "held_awaiting_adapter_upload", "held": True,
+                            "reopened_shards": reopened, "gate": info,
+                            "next_round": rnd}
                 return self._reject_and_advance(pool, pool_id, rnd, candidate, info,
                                                 eval_score, trainer_topics)
             return {"pool_id": pool_id, "round": rnd, "promoted": False,
@@ -1111,6 +1151,44 @@ class PoolService:
                 self.store.upsert_pool(pool)
             except Exception:  # noqa: BLE001
                 pass
+
+    # -- genome growth (worker-synthesized data -> live training set) ------
+    def promote_genome(self, pool_id: str, *, max_rows: int = 200,
+                       dry_run: bool = False) -> dict[str, Any]:
+        """Grow this pool's LIVE training genome from curated STAGING.
+
+        This is the explicit, gated, human/cron-driven step of the worker-local
+        synthesis flywheel. Miners run ``synthesize_qa`` on their OWN model and
+        submit ``{prompt, response}`` pairs; the coordinator curates them (schema
+        + length + groundedness gate + content-hash dedupe) into a STAGING
+        dataset (see :func:`curation.stage_submission`). This method is the ONLY
+        path that lets staged data enter the pool's live ``dataset_path`` — and
+        only after :func:`curation.promote_staging` re-validates, dedupes vs the
+        live genome, caps the batch at ``max_rows`` and snapshots a ``.bak``
+        backup first. It is never automatic.
+
+        Updates only ``dataset_sha256`` / ``dataset_rows`` on the pool record;
+        ``dataset_id`` is kept STABLE (it tracks the original ingest identity).
+        ``_load_round_records`` reads ``dataset_path`` each round, so the next
+        round shards the grown file. Honesty boundary: this grows the training
+        DATA; the actual model weight updates still require the GPU pool
+        train-loop reading that file each round.
+        """
+        from . import curation
+        with self._lock:
+            pool = self.get(pool_id)
+            summary = curation.promote_staging(
+                self.cfg, pool["dataset_path"],
+                max_rows=int(max_rows), dry_run=bool(dry_run))
+            if not dry_run and int(summary.get("promoted", 0)) > 0:
+                pool["dataset_sha256"] = summary["dataset_sha256"]
+                pool["dataset_rows"] = summary["dataset_rows"]
+                # dataset_id intentionally unchanged (tracks original ingest).
+                pool["updated_at"] = now_ts()
+                self.store.upsert_pool(pool)
+            summary["pool_id"] = pool_id
+            summary["dataset_id"] = pool.get("dataset_id")
+            return summary
 
     # -- payout (proportional, role-split) --------------------------------
     def payout(self, pool_id: str, *, round: Optional[int] = None,
