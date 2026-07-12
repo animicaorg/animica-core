@@ -71,7 +71,20 @@ from core.utils.time import maybe_normalize_unix_timestamp_seconds
 from core.utils.tx import normalize_tx_envelope
 from core.utils.hash import sha3_256
 from core.utils.pow import micro_threshold_to_target256
-from core.network_params import FORK_PQ_HARDENING, FORK_ROOT_COMMITMENT, is_fork_active
+from core.network_params import (
+    FORK_ADDRESS_FREEZE,
+    FORK_PQ_HARDENING,
+    FORK_ROOT_COMMITMENT,
+    is_fork_active,
+)
+# FORK_ADDRESS_FREEZE consensus set — imported at MODULE LOAD, deliberately NOT
+# inside a try/except. If the packaged freeze module were missing, we want
+# block_import to fail to import (node refuses to start) rather than silently
+# treating every block as unfrozen and ACCEPTING frozen-spend blocks that
+# upgraded peers reject — a silent consensus split. The module is pure stdlib
+# (typing only), so this cannot create an import cycle. Fail-closed, never halt:
+# a correctly-installed node always has it.
+from execution.migrations.address_freeze_2026 import is_frozen as _address_is_frozen
 from execution.runtime.env import make_block_env
 from execution.runtime.executor import apply_block
 from execution.state.apply_balance import (
@@ -514,6 +527,76 @@ def _verify_block_txs_root_gated(block: Block, height: int, chain_id: int) -> Op
     return None
 
 
+def _scan_block_frozen_addresses(block: Block, height: int) -> Optional[str]:
+    """Return a rejection reason if any non-coinbase tx spends FROM or TO a
+    consensus-frozen account active at ``height``; else None.
+
+    The sender is the tx's declared sender, which is authoritative here: the
+    pq_hardening gate (active below FORK_ADDRESS_FREEZE) has already verified
+    every signature against that sender's pubkey earlier in import_block, so a
+    hostile miner cannot forge a non-frozen sender. Coinbase txs are skipped (a
+    miner's own reward output is never frozen). Frozen digests are 32-byte account
+    keys, so an address that fails to decode is definitionally not frozen and is
+    skipped rather than false-rejected. Uses the module-level ``_address_is_frozen``
+    (imported at load, fail-closed) so the decision is a pure function of
+    (committed txs, height, code constant) — no per-node input, no split.
+    """
+    _is_frozen = _address_is_frozen
+    for idx, tx in enumerate(getattr(block, "txs", ()) or ()):
+        if _is_coinbase_tx(tx):
+            continue
+        try:
+            unsigned = _tx_unsigned(tx)
+            if unsigned is None:
+                unsigned = getattr(tx, "unsigned", tx)
+            sender = getattr(unsigned, "sender", None)
+            payload = getattr(unsigned, "payload", None)
+            to = (
+                getattr(payload, "to", None)
+                if payload is not None
+                else getattr(unsigned, "to", None)
+            )
+        except Exception as e:
+            # Structural decode quirk — the signature/structure gates already ran;
+            # don't false-reject a valid block here.
+            log.debug("frozen-scan decode skip [%d]: %r", idx, e)
+            continue
+        for role, addr in (("sender", sender), ("recipient", to)):
+            if addr is None:
+                continue
+            try:
+                key = _decode_address_bytes(addr)
+            except Exception:
+                continue
+            if _is_frozen(key, height=height):
+                return f"frozen_{role}[{idx}]:{bytes(key).hex()[:16]}"
+    return None
+
+
+def _verify_block_frozen_addresses_gated(
+    block: Block, height: int, chain_id: int
+) -> Optional[str]:
+    """FORK_ADDRESS_FREEZE forward-only gate: reject a block that moves funds
+    from or to a consensus-frozen (stolen / leaked-key) account once the freeze is
+    active for the chain. Returns a rejection reason (str) or None to accept.
+
+    Grandfathered below the activation height. The frozen set is a code constant
+    (execution.migrations.address_freeze_2026), byte-identical on every node, so
+    this decision is deterministic. Writes no state — a rule-violating block is
+    orphaned, never a silent balance fork.
+
+    Deliberately has NO env/shadow valve: a per-node env that suppressed the
+    rejection would make a shadow node ACCEPT a frozen-spend block that enforcing
+    nodes REJECT once the fork is active — a chain split. Determinism (identical
+    verdict on every upgraded node) is the whole point, so the verdict never reads
+    per-node state. Pre-activation the gate is inert (is_fork_active is False),
+    which is the only safe "observe" window and needs no valve.
+    """
+    if not is_fork_active(FORK_ADDRESS_FREEZE, height, chain_id=chain_id):
+        return None
+    return _scan_block_frozen_addresses(block, height)
+
+
 def _root_commitment_shadow() -> bool:
     """ANM-C03: opt-in post-execution state-root observability. When
     ANIMICA_ROOT_COMMITMENT_SHADOW=1, block import computes the full state root
@@ -735,6 +818,7 @@ class BlockImporter:
         "_pending_snapshots",
         "_data_dir",
         "_pinned_checkpoints",
+        "_invalid_blocks",
     )
 
     def __init__(
@@ -754,6 +838,13 @@ class BlockImporter:
         self.tx_index = tx_index
         self.state_db = state_db
         self.fork_choice = fork_choice
+        # Durable set of block hashes proven invalid at application time (7.1.9
+        # FORK_STATE_COMMITMENT: committed stateRoot != recomputed post-execution
+        # root). Persists on the importer across fork-choice rebuilds — the
+        # per-tree ForkChoice.invalid set is wiped by _restore_pre_reorg_state /
+        # _init_fork_choice_from_db, so this is the source of truth that is
+        # re-applied after every rebuild and short-circuits re-import.
+        self._invalid_blocks: set[bytes] = set()
         # Store full params dict for reward calculation (includes monetary.issuance)
         # If not provided, try to load from spec/params.yaml
         self.full_params_dict = full_params_dict
@@ -1167,6 +1258,19 @@ class BlockImporter:
                     f"0x{h.hex()} != pinned 0x{cp_pin.hex()}",
                 )
 
+            # Already proven invalid (7.1.9 FORK_STATE_COMMITMENT: a prior apply
+            # found its committed stateRoot != recomputed root). Short-circuit so a
+            # re-broadcast can never re-enter fork choice, re-trigger the reject
+            # dance, or stall the head. Durable across fork-choice rebuilds.
+            if h in self._invalid_blocks:
+                return ImportResult(
+                    ImportErrorCode.INVALID,
+                    cp_height,
+                    h,
+                    False,
+                    f"state_commitment: block 0x{h.hex()} previously rejected on committed-root mismatch",
+                )
+
             # Duplicate?
             if self.block_db.get_header_by_hash(h) is not None:
                 # already persisted
@@ -1420,6 +1524,21 @@ class BlockImporter:
             if root_error is not None:
                 return ImportResult(
                     ImportErrorCode.INVALID, height, h, False, f"root_commitment: {root_error}"
+                )
+
+            # FORK_ADDRESS_FREEZE: forward-only consensus address freeze. At/after
+            # the activation height, reject any block that moves funds from/to a
+            # code-committed frozen (stolen/leaked-key) account — turning the
+            # node-local, bypassable mempool freeze into a network-wide rule.
+            # Grandfathered below H; writes no state (orphans a bad block rather
+            # than silently forking balances). Runs after the signature gate so
+            # the tx sender is already pubkey-authenticated.
+            freeze_error = _verify_block_frozen_addresses_gated(
+                block, height, int(self.params.chain_id)
+            )
+            if freeze_error is not None:
+                return ImportResult(
+                    ImportErrorCode.INVALID, height, h, False, f"address_freeze: {freeze_error}"
                 )
 
             # Persist header & block
@@ -1717,6 +1836,15 @@ class BlockImporter:
             max_reorg_depth=self._max_reorg_depth,
         )
         self._seed_fork_choice_from_canonical()
+        # Re-apply durable invalidations so a state-rejected block (and its
+        # descendants) stay excluded across fork-choice rebuilds. Without this,
+        # _restore_pre_reorg_state's rebuild would forget the rejection and the
+        # block could be re-selected → head-stall loop.
+        for bad in self._invalid_blocks:
+            try:
+                self.fork_choice.mark_invalid(bad)
+            except Exception:
+                pass
 
     def _seed_fork_choice_from_canonical(self) -> None:
         if self.fork_choice is None:
@@ -2104,14 +2232,60 @@ class BlockImporter:
                 except Exception:
                     pass
 
-        if self.state_db is not None and old_state_snapshot is not None:
+        # Purge snapshot-cache entries the FAILED reorg may have overwritten with
+        # rejected-branch state. A failed reorg's apply loop captures a snapshot for
+        # every attached block it applies BEFORE the one that fails, so the poisoned
+        # heights span the WHOLE affected range [fork_point+1 .. best]. A DEEP reorg
+        # (fork point below old_head) therefore poisons heights <= old_head too — so
+        # purging only >old_head is INSUFFICIENT: a later reorg whose LCA lands on a
+        # poisoned <=old_head height fetches it on the primary `_state_snapshots.get(
+        # lca_height)` path (which bypasses the rebuild ancestor-cap), reverts to
+        # rejected-branch state, and false-rejects an honest block (post-activation) or
+        # silently diverges (pre-activation). (Adversarial review rounds 1-3:
+        # corruption F2 / liveness A / final blocker.) Purge every height the reorg
+        # touched — its low bound is min(old_canonical_hashes), the affected_start
+        # _apply_reorg computed; fall back to >old_head only if that is unavailable.
+        # old_head's own snapshot is re-established just below (revert or rebuild). Any
+        # purged height is re-derivable from canonical with a true-ancestor baseline.
+        _purge_from: Optional[int] = None
+        if old_canonical_hashes:
             try:
-                self.state_db.revert(old_state_snapshot)
-            except Exception:
-                log.error("state: failed to restore pre-reorg snapshot", exc_info=True)
-            else:
-                if old_head is not None:
-                    self._state_snapshots[int(old_head[0])] = old_state_snapshot
+                _purge_from = min(int(k) for k in old_canonical_hashes)
+            except ValueError:
+                _purge_from = None
+        if _purge_from is None and old_head is not None:
+            _purge_from = int(old_head[0]) + 1
+        if _purge_from is not None:
+            for _hgt in [k for k in list(self._state_snapshots.keys()) if int(k) >= _purge_from]:
+                self._state_snapshots.pop(_hgt, None)
+
+        if self.state_db is not None:
+            _restored = False
+            if old_state_snapshot is not None:
+                try:
+                    self.state_db.revert(old_state_snapshot)
+                    _restored = True
+                    if old_head is not None:
+                        self._state_snapshots[int(old_head[0])] = old_state_snapshot
+                except Exception:
+                    log.error(
+                        "state: failed to restore pre-reorg snapshot; rebuilding from canonical",
+                        exc_info=True,
+                    )
+            if not _restored and old_head is not None:
+                # No usable in-memory snapshot (capture returned None — e.g. snapshot()
+                # OOM'd on a large state — or revert threw). Self-heal from the DURABLE
+                # canonical chain rather than leave live state holding the rejected branch
+                # while the head is rolled back (silent balance divergence — adversarial
+                # review corruption F1). _apply_reorg captured _state_snapshots[old_height]
+                # from the correct pre-mutation state, so this reverts to the right baseline
+                # (or a lower one + replay). Fails LOUD, never silently diverges.
+                if not self._rebuild_state_from_canonical(int(old_head[0])):
+                    log.critical(
+                        "state: could not restore OR rebuild state after failed reorg; "
+                        "state may be inconsistent with head height=%s — operator action needed",
+                        int(old_head[0]),
+                    )
 
         # Reset fork-choice view to canonical DB view so failed branches don't pin best tip.
         self.fork_choice = None
@@ -2292,6 +2466,61 @@ class BlockImporter:
         
         return None
 
+    # Bound the durable invalid-block set so a PoW-gated wrong-root spam cannot grow
+    # it without limit (adversarial review liveness B). Eviction is SAFE: a re-imported
+    # invalid block is re-rejected deterministically by _apply_block_state, merely
+    # re-doing the cheap work; the cap only weakens the ingress short-circuit fast-path,
+    # never correctness.
+    _INVALID_BLOCKS_CAP = 100_000
+
+    def _record_invalid_block(self, h: bytes) -> None:
+        hb = bytes(h)
+        if hb in self._invalid_blocks:
+            return
+        if len(self._invalid_blocks) >= self._INVALID_BLOCKS_CAP:
+            try:
+                self._invalid_blocks.pop()  # bounded; arbitrary eviction is safe
+            except KeyError:
+                pass
+        self._invalid_blocks.add(hb)
+
+    def _state_commitment_reject_reason(self, block: Block) -> Optional[str]:
+        """FORK_STATE_COMMITMENT (7.1.9): a block committing a NON-ZERO stateRoot
+        must commit the real post-execution root. Call this immediately after the
+        block's state has been applied (state_db holds its post-state). Returns a
+        reason string on mismatch (→ reject), else None.
+
+        Split-safe by design: it checks the root of the ACTUAL application every
+        node performs against the block's parent state — deterministic and reorg-
+        covered, because this runs in the same _apply_state_reorg path for BOTH the
+        tip-extension and reorg-attached blocks (the exact bypass that sank the
+        reverted 7.1.8 gate). Self-gates on a zero/uncommitted root, so a pre-fork
+        or not-yet-upgraded zero-root miner is never false-rejected. NEVER raises: a
+        compute error returns None (do-not-reject), so a transient/node-local
+        failure fails OPEN on a single block rather than halting — enforcement only
+        turns on after a zero-mismatch shadow window, so a real determinism fault is
+        caught before activation, and 'never halt' is preserved.
+        """
+        try:
+            height = int(getattr(block.header, "height", 0) or 0)
+            chain_id = int(self.params.chain_id)
+            from core.network_params import FORK_STATE_COMMITMENT, is_fork_active
+
+            if not is_fork_active(FORK_STATE_COMMITMENT, height, chain_id=chain_id):
+                return None
+            committed = bytes(getattr(block.header, "stateRoot", b"") or b"")
+            if not committed or committed == b"\x00" * 32:
+                return None  # self-gate: zero/uncommitted root is accepted
+            from core.chain.state_commit import compute_state_root
+
+            observed = bytes(compute_state_root(self.state_db))
+            if observed != committed:
+                return f"committed={committed.hex()[:16]} observed={observed.hex()[:16]}"
+            return None
+        except Exception as e:  # never halt block apply on the verification itself
+            log.debug("state_commitment: check skipped (non-fatal): %s", e)
+            return None
+
     def _apply_state_reorg(
         self,
         detached: list[bytes],
@@ -2310,7 +2539,7 @@ class BlockImporter:
                 "state: missing snapshot for reorg; rebuilding from canonical chain",
                 extra={"lca_height": lca_height, "best_height": best.height},
             )
-            return self._rebuild_state_from_canonical(best.height)
+            return self._rebuild_state_from_canonical(best.height, max_baseline_height=lca_height)
 
         try:
             self.state_db.revert(snap)
@@ -2319,7 +2548,7 @@ class BlockImporter:
                 "state: failed to revert snapshot; rebuilding",
                 extra={"error": str(exc), "lca_height": lca_height},
             )
-            return self._rebuild_state_from_canonical(best.height)
+            return self._rebuild_state_from_canonical(best.height, max_baseline_height=lca_height)
 
         applied = 0
         for h in sorted(attached, key=self._block_height_for_hash):
@@ -2329,8 +2558,24 @@ class BlockImporter:
                     "state: missing block payload during reorg apply",
                     extra={"hash": h.hex(), "best_height": best.height},
                 )
-                return self._rebuild_state_from_canonical(best.height)
+                return self._rebuild_state_from_canonical(best.height, max_baseline_height=lca_height)
             if not self._apply_block_state(block):
+                # _apply_block_state now enforces FORK_STATE_COMMITMENT internally and,
+                # on a committed-root mismatch, records the block in _invalid_blocks.
+                # Distinguish the two False causes:
+                #  * state-commitment REJECT → return False so _apply_reorg rolls back
+                #    head+state to the pre-reorg snapshot. Do NOT rebuild to best
+                #    (best is the rejected branch — that would re-adopt it).
+                #  * ordinary execution failure → rebuild canonical state (unchanged).
+                if bytes(h) in self._invalid_blocks:
+                    log.error(
+                        "state_commitment: reorg attach rejected on committed-root mismatch",
+                        extra={
+                            "height": getattr(block.header, "height", None),
+                            "hash": h.hex(),
+                        },
+                    )
+                    return False
                 log.error(
                     "state: block execution failed during reorg; rebuilding canonical state",
                     extra={
@@ -2338,7 +2583,7 @@ class BlockImporter:
                         "hash": h.hex(),
                     },
                 )
-                return self._rebuild_state_from_canonical(best.height)
+                return self._rebuild_state_from_canonical(best.height, max_baseline_height=lca_height)
             height = _height_of(block.header)
             self._capture_state_snapshot(height)
             applied += 1
@@ -2379,7 +2624,13 @@ class BlockImporter:
         except Exception:
             return None
 
-    def _apply_block_state(self, block: Block) -> bool:
+    def _apply_block_state(self, block: Block, *, seal_only: bool = False) -> bool:
+        # seal_only=True is a dry-run used by compute_sealed_state_root(): it
+        # applies the identical state transition (txs + rewards + AICF, which drive
+        # the state root) but suppresses the NON-state side effects a candidate
+        # block must not cause — receipt persistence to block_db, the process
+        # coinbase metric, and shadow root logging. The caller snapshots and
+        # reverts around it, so the live state is unchanged.
         if self.state_db is None:
             return False
 
@@ -2445,13 +2696,14 @@ class BlockImporter:
             # stitch them into a new (frozen) Block, re-store it, and
             # write the receipt-pointer index that RPC reads.
             try:
-                self._persist_receipts(
-                    block=block,
-                    block_hash=block.header.hash(),
-                    height=int(getattr(block.header, "height", 0) or 0),
-                    non_coinbase_txs=non_coinbase_txs,
-                    block_result=block_result,
-                )
+                if not seal_only:
+                    self._persist_receipts(
+                        block=block,
+                        block_hash=block.header.hash(),
+                        height=int(getattr(block.header, "height", 0) or 0),
+                        non_coinbase_txs=non_coinbase_txs,
+                        block_result=block_result,
+                    )
             except Exception as persist_exc:
                 # Receipt persistence is best-effort; we don't want a
                 # serialization quirk to fail the whole block apply.
@@ -2467,9 +2719,35 @@ class BlockImporter:
             # Compute block rewards with AICF slicing
             height = int(getattr(block.header, "height", 0) or 0)
             chain_id = int(self.params.chain_id)
-            
+
+            # ANM-2026-07 incident clawback: one-time, height-gated recovery of
+            # funds the /wallet-export key-leak attacker swept to a collection
+            # address. Deterministic, value-preserving, non-fatal, reorg-safe —
+            # part of block H's state transition so every node applies it once.
+            try:
+                from execution.migrations.clawback_2026_07 import (
+                    apply_clawback_if_active as _apply_clawback,
+                )
+
+                _apply_clawback(self.state_db, height, chain_id)
+            except Exception as _clawback_exc:  # never halt import on the migration
+                log.error("ANM-2026-07 clawback hook error (non-fatal): %r", _clawback_exc)
+
+            # ANM-2026-07 treasury-scam clawback: forward-only (default H=44,444),
+            # moves two scam-source balances to the foundation treasury. Same
+            # deterministic/value-preserving/non-fatal/reorg-safe contract.
+            try:
+                from execution.migrations.clawback_treasury_scam_2026_07 import (
+                    apply_clawback_if_active as _apply_scam_clawback,
+                )
+
+                _apply_scam_clawback(self.state_db, height, chain_id)
+            except Exception as _scam_exc:  # never halt import on the migration
+                log.error("ANM-2026-07 treasury-scam clawback hook error (non-fatal): %r", _scam_exc)
+
+
             # Get all reward outputs (miner, AICF, treasury)
-            from consensus.rewards import compute_block_reward
+            from consensus.rewards import compute_block_reward, FOUNDATION_TREASURY_ADDRESS
             try:
                 reward_outputs = compute_block_reward(
                     chain_id=chain_id,
@@ -2511,7 +2789,11 @@ class BlockImporter:
                 for addr, amount in reward_outputs:
                     if addr == aicf_addr:
                         aicf_reward += amount
-                    elif addr == treasury_addr:
+                    elif addr == treasury_addr or addr == FOUNDATION_TREASURY_ADDRESS:
+                        # FORK_FOUNDATION_SPLIT: at/after H compute_block_reward emits
+                        # the treasury slice to the foundation address (!= the params
+                        # placeholder), so recognise it here or it would fall through
+                        # to the miner bucket and the miner would get 100%.
                         treasury_reward += amount
                     else:
                         # Miner reward (default)
@@ -2542,7 +2824,8 @@ class BlockImporter:
                     callsite="core.chain.block_import._apply_block_state",
                 )
                 global _BLOCK_COINBASE_CREDIT_TOTAL
-                _BLOCK_COINBASE_CREDIT_TOTAL += miner_total
+                if not seal_only:
+                    _BLOCK_COINBASE_CREDIT_TOTAL += miner_total
                 log.info(
                     "STATE_CREDIT miner=%s reward=%d fees=%d total=%d height=%d new_balance=%d",
                     block_env.coinbase.hex(),
@@ -2585,7 +2868,40 @@ class BlockImporter:
                     height,
                     aicf_balance,
                 )
-            
+
+            # FORK_FOUNDATION_SPLIT (7.1.0): credit the 15% foundation-treasury slice.
+            # compute_block_reward only emits a non-zero treasury slice on mainnet
+            # at/after the fork height, so this is self-gating and forward-only
+            # (treasury_reward == 0 below H => no-op, byte-identical to pre-7.1.0).
+            # Without this credit the slice would be computed and discarded -> 15% of
+            # every post-H subsidy destroyed (deflation). The address is decoded with
+            # core.utils.address.address_to_bytes -> the SAME 32-byte account key that
+            # getbalance reads and that the miner is credited on; do NOT use the AICF
+            # path's pq.address.bech32_decode (unresolvable module -> zero-key fallback
+            # -> funds credited to a dead key and invisible).
+            treasury_total = int(treasury_reward)
+            if treasury_total > 0:
+                from core.utils.address import address_to_bytes
+                treasury_addr_bytes = address_to_bytes(FOUNDATION_TREASURY_ADDRESS)
+                treasury_balance = state_credit(
+                    self.state_db,
+                    treasury_addr_bytes,
+                    treasury_total,
+                    reason="BLOCK_APPLY_FOUNDATION_TREASURY_REWARD",
+                    tx_hash=None,
+                    height=height,
+                    callsite="core.chain.block_import._apply_block_state",
+                )
+                if not seal_only:
+                    _BLOCK_COINBASE_CREDIT_TOTAL += treasury_total
+                log.info(
+                    "STATE_CREDIT treasury=%s reward=%d height=%d new_balance=%d",
+                    treasury_addr_bytes.hex(),
+                    treasury_total,
+                    height,
+                    treasury_balance,
+                )
+
             # Process AICF accounting (credits, epochs, etc.)
             try:
                 from execution.runtime.aicf_integration import process_block_for_aicf
@@ -2605,8 +2921,9 @@ class BlockImporter:
             except Exception as e:
                 log.error(f"AICF: Failed to process block {height}: {e}", exc_info=True)
             
-            # Log total coinbase credit metric
-            total_credited = miner_total + aicf_total
+            # Log total coinbase credit metric (include the foundation-treasury slice
+            # so the metric matches the actual coinbase emission post-FORK_FOUNDATION_SPLIT).
+            total_credited = miner_total + aicf_total + int(treasury_reward)
             if total_credited > 0:
                 log.info(
                     "metric block_coinbase_credit_total=%d",
@@ -2618,7 +2935,7 @@ class BlockImporter:
             # AICF) is finalized above, so this observes the canonical root that a
             # future miner-seal must commit. Exceptions are swallowed: observability
             # must never break block apply.
-            if _root_commitment_shadow():
+            if not seal_only and _root_commitment_shadow():
                 try:
                     from core.chain.state_commit import compute_state_root
 
@@ -2662,6 +2979,30 @@ class BlockImporter:
                 except Exception as e:  # pragma: no cover - never break apply
                     log.debug("root_commitment SHADOW: compute failed: %s", e)
 
+            # 7.1.9 FORK_STATE_COMMITMENT enforcement — placed HERE, the SINGLE
+            # chokepoint every apply path funnels through: normal reorg-attach, the
+            # missing-LCA-snapshot rebuild fallback, AND startup rebuild all call
+            # _apply_block_state. So the accept/reject verdict is identical on every
+            # node and cannot be bypassed by a node that happens to lack an LCA
+            # snapshot (the split hole the adversarial review found when the check
+            # lived only in the _apply_state_reorg attach loop). Skipped for the
+            # miner-seal dry-run (seal_only).
+            if not seal_only:
+                _sc_reason = self._state_commitment_reject_reason(block)
+                if _sc_reason is not None:
+                    _bad_h = block.header.hash()
+                    log.error(
+                        "state_commitment: rejecting block on committed-root mismatch",
+                        extra={"height": height, "hash": _bad_h.hex(), "reason": _sc_reason},
+                    )
+                    self._record_invalid_block(_bad_h)
+                    try:
+                        if self.fork_choice is not None:
+                            self.fork_choice.mark_invalid(_bad_h)
+                    except Exception as _mi_exc:
+                        log.error("state_commitment: mark_invalid failed: %s", _mi_exc)
+                    return False
+
             return True
         except Exception as exc:
             try:
@@ -2685,6 +3026,33 @@ class BlockImporter:
                 },
             )
             return False
+
+    def compute_sealed_state_root(self, block: Block) -> bytes:
+        """Post-execution ``stateRoot`` a 7.1.9 miner must seal into ``block``.
+
+        Applies ``block`` to a snapshot of the CURRENT (parent) state via the
+        exact validator path (``_apply_block_state``), reads ``compute_state_root``
+        over the finalized post-block state, then reverts — the live state is left
+        byte-identical (snapshot/revert covers accounts AND PFX_AICF). Because it
+        runs the identical apply a validator runs at import, the sealed root equals
+        what every FORK_STATE_COMMITMENT node computes, by construction — there is
+        no second implementation of the transition to drift out of agreement.
+
+        ``seal_only`` suppresses the apply's non-state side effects (receipt
+        persistence, coinbase metric, shadow logging). Raises if the block would
+        not apply — a miner must never seal a block it cannot execute.
+        """
+        if self.state_db is None:
+            raise RuntimeError("compute_sealed_state_root: no state_db")
+        snap = self.state_db.snapshot()
+        try:
+            if not self._apply_block_state(block, seal_only=True):
+                raise RuntimeError("compute_sealed_state_root: block did not apply")
+            from core.chain.state_commit import compute_state_root
+
+            return compute_state_root(self.state_db)
+        finally:
+            self.state_db.revert(snap)
 
     def _capture_state_snapshot(self, height: int) -> None:
         if self.state_db is None:
@@ -2895,16 +3263,29 @@ class BlockImporter:
             for height in sorted(missing_heights)[:3]:  # Create max 3 at a time
                 self._create_disk_snapshot(height)
 
-    def _rebuild_state_from_canonical(self, target_height: int) -> bool:
+    def _rebuild_state_from_canonical(
+        self, target_height: int, *, max_baseline_height: Optional[int] = None
+    ) -> bool:
         if self.state_db is None:
             return False
         target = max(0, int(target_height))
 
-        candidate_heights = [h for h in self._state_snapshots.keys() if int(h) <= target]
+        # Constrain the baseline to a GUARANTEED ANCESTOR of the target. Height-keyed
+        # _state_snapshots are overwritten across reorgs, so a snapshot at height h is
+        # NOT necessarily the canonical block at h after a reorg. When rebuilding for a
+        # reorg the caller passes max_baseline_height=LCA: every height <= the fork point
+        # is on the shared pre-fork chain and IS a true ancestor of the new canonical
+        # target, so replaying canonical blocks on top of it reconstructs the correct
+        # state — and correct committed roots. Without this, rebuild could revert to an
+        # OLD-branch baseline and, under FORK_STATE_COMMITMENT, false-reject an HONEST
+        # block on a restarted/sparse-cache node (adversarial re-review, HIGH: honest-
+        # reorg split + head stall). Genesis (height 0) is always an eligible ancestor.
+        _cap = target if max_baseline_height is None else min(target, int(max_baseline_height))
+        candidate_heights = [h for h in self._state_snapshots.keys() if int(h) <= _cap]
         if not candidate_heights:
             log.error(
                 "state: rebuild requested without any available snapshot",
-                extra={"target_height": target},
+                extra={"target_height": target, "max_baseline_height": max_baseline_height},
             )
             return False
 

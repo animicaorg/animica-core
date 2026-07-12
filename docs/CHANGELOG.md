@@ -8,171 +8,149 @@ Module-scoped, low-level tweaks that don’t affect the user experience live in 
 
 ---
 
-## [6.0.4] - 2026-07-07
-ENA GPU-trainer reliability (QLoRA). **No consensus change** — fully compatible with 6.0.x,
-no coordinated upgrade. Fixes three distinct trainer failures GPU operators hit:
+## [7.1.7] - 2026-07-11
+### Changed — AICF inference uses every GPU on a multi-GPU rig
+Worker-side; non-consensus. Especially benefits agent/coding workloads, which get
+the largest model the hardware can serve.
 
-- **`CUDA error: CUBLAS_STATUS_NOT_SUPPORTED` in the bitsandbytes 4-bit matmul.** Some
-  GPU/bitsandbytes/CUDA combinations can't run the 4-bit (QLoRA) kernel. The trainer now
-  **auto-falls back to non-quantized LoRA (fp16)** and retries the round once when it sees a
-  quant-unsupported error (`CUBLAS_STATUS_NOT_SUPPORTED` / "no kernel image is available" /
-  cublasLt), instead of failing the shard. Set `ANIMICA_ENA_NO_QUANT_FALLBACK=1` to disable
-  the retry, or `ANIMICA_ENA_DISABLE_QUANT=1` to skip 4-bit up front. The fallback is
-  deliberately **not** taken on `illegal memory access` (that corrupts the CUDA context, so
-  an in-process retry can't recover — it's prevented, below). Upgrading `bitsandbytes` on the
-  worker usually clears the underlying incompatibility.
-- **`CUDA error: an illegal memory access` in DPO.** SFT already clamped sequences to the
-  model's `max_position_embeddings`; DPO did not, so position ids could run off the end of
-  the position table. DPO now applies the same clamp and passes `max_length` /
-  `max_prompt_length` to `DPOConfig`.
-- **"The attention mask is not set … because pad token is …".** Only the tokenizer's
-  `pad_token` was set; the model didn't know its `pad_token_id`. Now `model.config.pad_token_id`
-  and `generation_config.pad_token_id` are set so the attention mask is inferred and padding
-  is masked correctly at train + eval.
+- `animica up` now pools the VRAM of **all** visible GPUs (CUDA via torch, or every
+  line of `nvidia-smi`) when choosing which serving tiers to advertise, instead of
+  reading only GPU 0. A multi-GPU rig therefore qualifies for the larger tiers and
+  serves a bigger model — e.g. a 4×24 GB rig reaches the elite (32B) tier.
+- The inference engine shards that model across every card via `device_map="auto"`
+  (set `ANIMICA_AICF_DEVICE_MAP=balanced` to spread evenly), and the load log prints
+  `gpus_used=N/M` so operators can confirm all GPUs are engaged.
+- Honest gating: the pooled VRAM is discounted a small per-GPU overhead (multi-GPU
+  only) so a rig of small cards can't advertise a tier it would only OOM or silently
+  CPU-offload on; `nvidia-smi` parsing tolerates a bad per-card line, and CPU/disk
+  offload is logged loudly instead of serving at 10-100× slowdown.
 
-## [6.0.3] - 2026-07-07
-P2P peering + ENA trainer reliability fixes. **No consensus change** — nothing here touches
-block, state, or transaction validation, so it is fully compatible with 6.0.0/6.0.1/6.0.2
-and needs no coordinated upgrade.
+### Fixed — Node Docker image builds again (PQ backend self-test)
+Node operators / CI only; non-consensus, no on-box or on-chain behaviour change.
 
-- **P2P: nodes behind Docker/NAT no longer blackhole inbound peers.** When a node runs
-  behind `docker-proxy` (or any SNAT), every external peer arrives under a single private
-  bridge-gateway IP. The per-IP inbound-connection cap and the per-IP handshake-rate limiter
-  then throttled *the entire internet* as one host and, once exhausted, closed the socket
-  before writing any handshake byte — so a dialing peer saw `HandshakeError: 0 bytes read on
-  a total of 18 expected bytes` and never connected (symptom: "live peers stay 0").
-  - New `_is_nat_collapsed_host()` exempts private, non-loopback/link-local sources from the
-    **per-IP** connection and handshake-rate caps (they fall through to the global cap only);
-    genuine distinct public IPs stay rate-limited as before.
-  - Configured seed/verifier hosts are now plumbed into the transport and peer registry as
-    **trusted hosts** and are cap-exempt.
-  - The global inbound cap default is raised (`ANIMICA_P2P_INBOUND_CONN_GLOBAL_PER_MIN`
-    40 → 300) so a healthy seed can sustain real peer volume.
-  - On rejection the node now sends a best-effort **handshake reject frame**
-    (`ANIMICA/TCP/RJ/V0`), and the dialer reports a clear reason ("peer rejected connection:
-    inbound_capped" / "peer closed before handshake (connection refused or inbound-capped)")
-    instead of an opaque byte count. Fully backward-compatible with older peers.
-- **ENA: fix the trainer crash on newer Python / HuggingFace `datasets`.** `Dataset.from_list`
-  fingerprint-hashing raised `Pickler._batch_setitems() takes 2 positional arguments but 3
-  were given` on Python 3.13+ with an old `datasets` (its `_dill.Pickler` used the pre-3.13
-  signature). Fixed by raising the `datasets` floor to `>=3.0.0` (and pinning `dill>=0.3.8`)
-  **and** installing an idempotent runtime compat-shim in `_require_transformers()` so already
-  provisioned environments with a transitively-pinned old `datasets` also work.
-- **ENA: graceful CUDA-fault handling.** `trainer.train()` is now wrapped so a
-  `CUDA error: an illegal memory access`/device-side assert synchronizes, clears the cache,
-  and fails just that round (`TrainingError`) instead of killing the whole worker. Opt-in
-  `ANIMICA_ENA_CUDA_DEBUG=1` sets `CUDA_LAUNCH_BLOCKING`/`TORCH_USE_CUDA_DSA` for accurate
-  diagnosis.
-- **ENA: worker survives transient coordinator/RPC 503s.** The remote client now retries
-  only transient failures (429/502/503/504, connection/timeout) with bounded jittered
-  backoff (`ANIMICA_ENA_WORKER_HTTP_RETRIES`, `ANIMICA_ENA_WORKER_HTTP_BACKOFF`), failing
-  fast on real 4xx.
+- `ops/docker/scripts/pq_backend_selftest.py` failed the node image build at the
+  final `RUN` step. It required a working **SPHINCS+-SHAKE-128s** keypair, but
+  SPHINCS+ (scheme id 2) is a forgeable stub that is **disabled on mainnet**
+  (`coretx.schemes`, ANM-C01/L06) and has no backend other than the *insecure*
+  pure-Python fallback (gated behind `ANIMICA_ALLOW_PQ_PURE_FALLBACK=1`). A mainnet
+  build leaves that flag unset, so the self-test raised `NotImplementedError` and
+  `docker build` exited 1.
+- The self-test now **requires `ml_dsa_65`** — scheme id 11, the only
+  mainnet-enabled signature scheme, which the old test did not cover at all — with a
+  keypair/sign/verify round-trip **plus tamper-rejection** (a modified message or
+  signature must fail to verify), and **asserts SPHINCS+ is gated off** instead of
+  demanding it mint forgeable keys. The disabled, forgeable `dilithium3` (id 1) is no
+  longer exercised. No production node ever enables the insecure pure-Python fallback.
 
-## [6.0.2] - 2026-07-07
-Node liveness + trainer stability fixes. **No consensus change** — nothing here touches
-block, state, or transaction validation, so it is fully compatible with 6.0.0/6.0.1 and
-needs no coordinated upgrade.
+## [7.1.6] - 2026-07-11
+### Fixed — AICF inference uses the Apple Metal (MPS) GPU, not the CPU
+Non-consensus, worker-side.
 
-- **P2P: fix an event-loop wedge that could stall block production.** Two independent DoS
-  vectors let peer traffic starve the node's single async event loop (silently — the node
-  keeps a stale head while `getblock*`/`getbalance` time out):
-  - **GET_HEADERS anchor scan was O(chain height).** `_locate_anchor` walked *every* block
-    height from the head down to genesis doing one synchronous DB read each, so a peer
-    sending a header locator full of unknown/foreign-chain hashes forced tens of thousands
-    of blocking reads per request (worsening as the chain grows). It now walks the peer's
-    (bounded) locator instead — at most one lookup + one canonical check per entry — with
-    identical semantics.
-  - **Peer banning was disabled.** Provably-incompatible peers (`wrong_genesis`/`wrong_chain`)
-    were penalised and dropped but never banned, so they reconnected in a hot loop and
-    re-ran the CPU-heavy pure-Python AEAD handshake forever. Banning is now enabled
-    (env-gated, default on: `ANIMICA_P2P_BAN_ENABLED=0` to disable), and the TCP transport
-    now rejects flooding hosts with a pre-handshake sliding-window rate limit (global +
-    per-host; tunable via `ANIMICA_P2P_INBOUND_CONN_GLOBAL_PER_MIN` /
-    `ANIMICA_P2P_INBOUND_CONN_PER_MIN`) so a connection flood can't saturate the loop.
-- **ENA training: fix `CUDA error: an illegal memory access` on GPU train shards.** SFT now
-  (1) resizes token embeddings to cover the tokenizer so an out-of-range id can't index off
-  the embedding table, (2) clamps `max_seq_len` to the model's `max_position_embeddings` so
-  a long row can't overrun the position table, and (3) drops any row carrying an out-of-vocab
-  token id as a final guard.
+- The inference engine (`aicf_inference._try_load`) only ever loaded models on
+  `cuda` or `cpu`. On an Apple Silicon Mac (M1/M2/M3) `torch.cuda.is_available()`
+  is False, so it silently ran **every model on the CPU cores** — the Metal GPU
+  went unused. It now auto-detects the accelerator (CUDA → Apple Metal/MPS → CPU)
+  and loads on MPS in fp16, so Mac miners actually serve on the GPU. Pin with
+  `ANIMICA_AICF_DEVICE=cpu|cuda|mps` to override.
 
-## [6.0.1] - 2026-07-05
-Sets the mainnet consensus-activation height to the coordinated value **40,000** (6.0.0
-shipped a placeholder 100,000). At this height upgraded nodes begin enforcing the 6.0.0
-consensus rules (ml_dsa_65 signature verification, txsRoot/proofsRoot commitment,
-deterministic emission). **Every node must run 6.0.1 (or set
-`ANIMICA_FORK_PQ_HARDENING_HEIGHT` / `ANIMICA_FORK_ROOT_COMMITMENT_HEIGHT=40000`) before
-height 40,000** — the activation height is a network-wide consensus parameter and must be
-identical everywhere. Normal empty/coinbase-only zero-root blocks pass the gates at
-activation, so honest miners are not forked; only rule-violating blocks are rejected. The
-change is P2P-transparent (the mainnet params-hash is pinned), so 6.0.1, 6.0.0, and legacy
-nodes all continue to peer during the runway.
+## [7.1.5] - 2026-07-11
+### Fixed — `animica up` gates AICF serving tiers by memory
+Non-consensus, worker-side.
 
-## [6.0.0] - 2026-07-04
-Security & consensus hardening release. Closes the findings in the internal
-Security & Consensus Findings Report. **Every consensus change is forward-only and
-height-gated** (mainnet activation H=37000, tunable via `ANIMICA_FORK_*_HEIGHT`),
-grandfathering all existing history — **no genesis reset, no hard fork**, and no
-legitimately-mined historical block is rejected. Node-local hardening (RPC, P2P,
-snapshot, wallet, mempool) is always-on and independent of the activation height.
+- `animica up` previously advertised `standard,premium,elite` for **any** GPU box,
+  so an Apple Silicon Mac (Metal counts as a GPU) would claim `elite` and try to
+  fetch/serve **Coder-32B (~65 GB)** — which won't fit an M2 mini's unified memory,
+  wasting a huge download and failing at serve time. It now picks tiers from the
+  machine's actual memory (GPU VRAM / Apple unified memory; CPU boxes use system
+  RAM and cap at `standard`, since larger models are impractically slow on CPU):
+  `free` ≥3 GB, `standard` ≥7 GB, `premium` ≥15 GB, `elite` ≥72 GB (Coder-32B
+  needs an 80 GB-class accelerator). So a typical M2 mini serves
+  `standard`+`premium` and skips `elite`. Explicit `ANIMICA_AICF_TIERS` still
+  overrides the pool-facing worker's tiers. The chosen tiers show in `animica up --plan`.
 
-### Migration
-- **Nodes and the pool/miner must upgrade before H=37000.** At that height,
-  upgraded nodes begin enforcing mandatory transaction-signature verification
-  (ml_dsa_65 / alg 0x1003 only), txsRoot/proofsRoot commitment, and deterministic
-  emission. A node that upgrades while the network does not — or that still accepts
-  stub-scheme (0x1001/0x1002) transactions — will orphan non-compliant blocks.
-- **RPC:** sensitive methods can now require a bearer token
-  (`ANIMICA_RPC_AUTH_TOKEN`) and be denylisted (`ANIMICA_RPC_RESTRICT_SENSITIVE`);
-  CORS-credentials no longer defaults open.
-- **Wallet:** `wallets.json` is encrypted at rest when a passphrase is provided
-  (`animica wallet create --password`, `ANIMICA_WALLET_PASSPHRASE[_FILE]`, or
-  `animica wallet encrypt`); plaintext stores still load (with a warning).
-- **Mempool** now enforces a min-fee floor, per-sender caps, funded-sender and
-  mandatory signature verification on mainnet (all env-tunable).
+## [7.1.4] - 2026-07-11
+### Added — miners pre-install their models; `animica up` is ready-to-serve
+Non-consensus, worker-side.
 
-### Fixed — Critical
-- **Forgeable post-quantum signature schemes (ANM-C01).** Schemes 1 (dilithium3)
-  and 2 (sphincs) verified via a public hash with no secret, so anyone with a
-  public key could forge a valid signature and — because accounts are keyed by
-  `sha3_256(pubkey)` with the alg id stripped — drain the victim's real account.
-  Only the FIPS-204 scheme ml_dsa_65 (0x1003) is now accepted; the stubs are
-  rejected at both signature stacks.
-- **Block import applied balances with no signature verification (ANM-C02).** A
-  hostile miner could include unsigned/forged transfers. Import now verifies every
-  transaction signature (height-gated, fail-closed).
-- **Contract `exec()` remote code execution + unbounded-loop DoS (ANM-C05/C06).**
-  The raw-`exec()` contract path is fail-closed by default; contracts REVERT.
-- **Header roots never validated on import (ANM-C03).** A PoW-valid header could
-  carry a different transaction or proof set and diverge nodes silently. txsRoot
-  and proofsRoot are now verified on import (self-gating, grandfathered); the
-  post-execution state root is computed and shadow-logged for a later enforcement.
-- **Plaintext wallet private keys (ANM-C07).** At-rest AES-256-GCM encryption.
-- **Unauthenticated RPC + snapshot import path traversal / silent divergence
-  (ANM-C08/C10/C11).** Opt-in RPC auth; snapshot path validation, caps, and a
-  completeness gate before head is set.
+- **`animica up` (and `miner start --aicf` / `aicf-worker start`) now pre-download
+  the models for the tiers the miner advertises**, in the background, so the first
+  inference job serves immediately instead of stalling minutes on a multi-GB fetch.
+  Idempotent and best-effort (a failure just falls back to lazy download). Disable
+  with `ANIMICA_AICF_PREFETCH=0`.
+- **New `animica miner install [--tiers …]`** to pre-fetch the tier models up front
+  with visible progress (defaults to `ANIMICA_AICF_TIERS`, else all tiers).
 
-### Fixed — High / Medium / Low (selected)
-- Deterministic difficulty (θ) warmup independent of node uptime (ANM-H01).
-- Exact-integer block emission — proven value-preserving — removing the float
-  determinism hazard; reward computation fails closed (ANM-H08/M04).
-- Mempool: fee floor, per-sender caps, nonce-aware eviction, mandatory
-  signatures, block-mineability bounds (ANM-H07/H10/M08/M09).
-- Canonical transaction id + strict-minimal CBOR (gated) closing txid
-  malleability (ANM-H09/M10/M05/L07).
-- P2P: bounded decompression + per-peer rate limiting; refuse insecure AEAD
-  downgrade (ANM-H03/H04/L01).
-- Deterministic error codes in consensus-hashed logs (ANM-L02); secure wallet
-  scheme defaults + mainnet insecure-keygen guard (ANM-M07); genesis alloc-cap
-  enforced for new networks (ANM-M04).
+## [7.1.3] - 2026-07-11
+### Improved — much better AI coding, served by miners
+Non-consensus. All changes live in the miner-served AICF worker and the edge
+gateway; no chain fork, no node changes. A miner picks these up simply by
+running `animica up` or `animica miner aicf-worker start` on 7.1.3.
 
-### Known limitations (tracked, not shipped in 6.0.0)
-- Full PoIES useful-work verification (ANM-C04) requires building the proof
-  verifier package and activating PoIES as a coordinated protocol upgrade; only
-  the proofsRoot commitment is enforced here.
-- P2P handshake authentication (ANM-C09/C10) is deferred to an opt-in negotiated
-  migration to avoid orphaning current peers.
+- **Dynamic, capability-based token cap.** The old fixed 128-token cap truncated
+  almost every code file mid-function. The worker now sizes each job to *what it
+  can actually handle* — derived from the loaded model's context window and the
+  device class (CPU vs CUDA/MPS), recomputed per job. "As large as the network
+  can handle at any given time." Pin a hard ceiling with `ANIMICA_AICF_MAX_TOKENS`.
+- **Coder-tuned tier defaults.** `standard`→`Qwen2.5-Coder-3B`, `premium`→
+  `Qwen2.5-Coder-7B`, `elite`→`Qwen2.5-Coder-32B` (was general Qwen 1.5B/3B/7B).
+  `free` stays a small general model. Auto-detection still upgrades to any larger
+  cached/bundled model; per-tier overrides (`ANIMICA_AICF_MODEL_<TIER>`) unchanged.
+- **Code-aware prompting.** Generic coding requests get a lean coding system
+  prompt (and skip Animica RAG injection, which was derailing small models);
+  Animica-specific questions keep their doc grounding. Override with
+  `ANIMICA_AICF_CODING_PROMPT`.
+- **Edge gateway + agents** default to a high output budget so the *worker's*
+  dynamic cap is the real limit, and the animica.dev coding agents run on any
+  serving tier (best available) instead of a single pinned model.
 
----
+## [7.1.1] - 2026-07-10
+### Added — the Verifiable Inference Engine (VIE)
+A **non-consensus** AI-engine upgrade. No chain fork, no genesis, the node never
+halts; everything here lives in the ENA coordinator + the `animica ai serve`
+gateway, never in block validation. All new behavior is additive and backward
+compatible — set the flags below to opt in.
+
+- **Proof-of-Inference receipts.** Every completion from `/v1/chat/completions`
+  and `/v1/completions` can carry an `animica_receipt`: a content-hashed
+  (SHA3-256), post-quantum **ML-DSA-65-signed** (FIPS-204, domain
+  `animica.ai.proof-of-inference.v1`) record of `(model, provider, prompt-hash,
+  output-hash, tokens, seed, nonce)`, plus an `X-Animica-Receipt` response
+  header. Controlled by `ANIMICA_AI_RECEIPTS=off|hash|signed` (default `signed`,
+  degrades to `hash` when no signing key/PQ is available). `off` is byte-identical
+  to 7.1.0. The gateway signs on a threadpool so the ~ms PQ signature never blocks
+  the event loop. Signed by a **dedicated inference key** that controls no funds.
+- **Quantum-seeded sampling.** Opt in per request with `{"animica":{"quantum_seed":
+  true}}` (or `ANIMICA_AI_QUANTUM_SEED=1`): the RNG seed is derived from the node's
+  quantum randomness beacon (falling back, honestly labelled, to the node CSPRNG
+  then a local seed), and its provenance is recorded in the receipt.
+- **Offline replay + verification.** `animica ai verify <receipt.json>` recomputes
+  the hash and checks the signature with no node/model; `animica ai replay
+  <receipt.json> --prompt "…"` re-runs seed-honoring local backends and checks the
+  output hash. Replay is honest: `verified` only for reproducible local backends,
+  `best_effort` for remote ones. New: `animica ai receipt show/verify`, and gateway
+  routes `POST /v1/verify`, `GET /v1/signer`.
+- **Provider mesh + intelligent router.** First-class **Claude** (Opus 4.8, Sonnet 5,
+  Haiku 4.5, Fable 5), **Chutes/Bittensor**, and **ENA-served-checkpoint** backends,
+  behind `providers.register_adapter`. A policy router adds ordered fallback chains,
+  EWMA-latency telemetry, and a SQLite-backed circuit breaker (`GET
+  /v1/router/status`). With no routing policy configured, routing is a pure
+  pass-through — unchanged behavior. `animica ai chat --provider anthropic` works
+  out of the box with `ANTHROPIC_API_KEY`.
+
+### Changed
+- `ModelAdapter.generate(...)` gains a keyword-only `seed=`, honored by
+  deterministic/OpenAI-compatible/Ollama backends (and forwarded by the mesh);
+  default `None` keeps every existing output unchanged.
+- Gateway version string → `7.1.1`; `/health` now reports `receipts` mode and the
+  (public-only) signer identity.
+
+### Notes / boundaries (honest)
+- The receipt **signature** is post-quantum (ML-DSA-65); the beacon **attestation**
+  is classical (Ed25519 software self-signer unless a hardware QRNG is attached).
+  The two are kept distinct in the receipt schema.
+- On-chain anchoring degrades to a local envelope (`pending_node_rpc`) — the node
+  `aicf.anchorReceipt` RPC does not exist yet.
+- Heavy deps (fastapi/uvicorn/torch/etc.) remain lazy; stdlib-only paths are the default.
 
 ## [5.3.4] - 2026-07-03
 ### Fixed
