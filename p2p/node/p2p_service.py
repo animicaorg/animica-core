@@ -167,6 +167,17 @@ STALL_CACHE_SHORT_CIRCUIT = "STALL_CACHE_SHORT_CIRCUIT"
 STALL_VERIFY_BACKPRESSURE = "STALL_VERIFY_BACKPRESSURE"
 
 
+def _max_reorg_depth() -> int:
+    """Reorg-depth bound shared with the importer (core.chain.block_import
+    DEFAULT_MAX_REORG_DEPTH reads the same env, and accepts 0 = never reorg).
+    Used to bound how far below the local head a fork-sibling header is still
+    worth ingesting; 0 disables sibling ingest entirely to match the importer."""
+    try:
+        return max(0, int(os.environ.get("ANIMICA_MAX_REORG_DEPTH", "96")))
+    except (TypeError, ValueError):
+        return 96
+
+
 @dataclass(slots=True)
 class _PeerState:
     session_id: str
@@ -1284,6 +1295,12 @@ class P2PService:
         self._sync_last_not_anchored_at = 0.0
         self._sync_recovery_attempts = 0
         self._sync_last_recovery_action: Optional[str] = None
+        # 38728-wedge telemetry/limits: consecutive full-window overlap-only
+        # header batches (see _process_headers), and per-height counts of
+        # fork-sibling block enqueues (anti-spam cap in
+        # _enqueue_missing_blocks).
+        self._sync_overlap_full_batches = 0
+        self._sibling_enqueue_counts: dict[int, int] = {}
         self._sync_last_recovery_at: Optional[float] = None
         self._sync_last_recovery_reason: Optional[str] = None
         self._sync_last_locator_summary: Optional[dict[str, Any]] = None
@@ -5237,7 +5254,18 @@ class P2PService:
     ) -> bool:
         network_best_height = self._network_best_height()
         if network_best_height is None:
-            return False
+            # 38728 wedge: every stuck node reported network_best_height=null
+            # (no peer survived the responsive-peer filter), which disarmed
+            # this recovery even while a seed kept serving it full header
+            # batches. Fall back to the heights of blocks already QUEUED for
+            # download — concrete, pipeline-vetted evidence the network
+            # extends past us (the live stuck nodes held ~10 queued blocks).
+            # Deliberately NOT raw header heights: those are peer-claimed and
+            # unvalidated, so a single malicious peer could arm resets at tip.
+            queued = self._sync_block_queue_heights.values()
+            if not queued:
+                return False
+            network_best_height = max(queued)
         # Only reset if we're at least 2 blocks behind to avoid false positives
         # when verifier+1 allows miners but no one is at that height yet
         if int(network_best_height) <= int(head_height) + 1:
@@ -9952,6 +9980,38 @@ class P2PService:
             return False
         return canonical_hash == bytes(header_hash)
 
+    def _is_fork_sibling_header(self, header: "_SyncHeader") -> bool:
+        """True when `header` is the base of a competing branch at/below our head.
+
+        A node that accepted the losing side of a same-height fork (block 28167,
+        block 38728) needs the WINNING sibling — a header whose height is at or
+        below its own head, whose hash differs from its canonical block at that
+        height, and whose parent IS on its canonical chain. The legacy headers
+        pipeline dropped exactly that header at every layer (overlap trim,
+        first-header anchor_mismatch, not-actionable reuse, below-head enqueue
+        skip), so the losing branch could never hand fork choice the competing
+        base and the node wedged forever. Bounded to the reorg depth the
+        importer will actually accept.
+        """
+        try:
+            height = int(header.height)
+            if height <= 0:
+                return False
+            local_height, _ = self._local_head()
+            local_height_int = int(local_height or 0)
+            if height > local_height_int:
+                return False
+            depth = _max_reorg_depth()
+            if depth <= 0 or (local_height_int - height) >= depth:
+                return False
+            if self._header_on_local_chain(header.hash, height=height):
+                return False
+            return self._header_on_local_chain(
+                header.parent_hash, height=height - 1
+            )
+        except Exception:
+            return False
+
     def _trim_leading_canonical_overlap(
         self, peer: _PeerState, headers: list[HeaderCompact], *, local_height: int
     ) -> tuple[list[HeaderCompact], int]:
@@ -10003,6 +10063,16 @@ class P2PService:
             self._record_header_vote(header.hash, peer.remote)
             reused.append(header)
             if header.height > local_height_int:
+                actionable.append(header)
+            elif self._is_fork_sibling_header(header):
+                # Base of a competing branch at/below our head: fetch its block
+                # so fork choice can weigh the branch (38728 wedge — reused
+                # headers at local height were never actionable, so the winning
+                # sibling was dropped here even when a peer kept re-serving it).
+                # Deliberately does NOT set recovered_missing_headers: progress
+                # is only credited when the enqueue below actually queues the
+                # block, so a re-served sibling whose fetch keeps failing can't
+                # keep resetting the stall clock.
                 actionable.append(header)
             elif not was_buffered and self._needs_local_block_replay(
                 header.hash, height_hint=header.height
@@ -10113,7 +10183,20 @@ class P2PService:
                 )
                 break
             if hdr.height <= int(local_height or 0):
-                continue
+                # At/below-head headers are normally already ours — but a fork
+                # SIBLING (same height, different hash, parent on our chain) is
+                # the base of a competing branch and must be fetched or a node
+                # on the losing side of a fork can never reorg (38728 wedge).
+                if not self._is_fork_sibling_header(hdr):
+                    continue
+                # A sibling claim is cheap to fabricate (compact headers carry
+                # no verifiable PoW at this layer), so cap how many DISTINCT
+                # candidates per height we will fetch: junk blocks fail import
+                # anyway, this just bounds the wasted downloads. A real fork
+                # has one winning sibling; 4 leaves room for deeper races.
+                h_key = int(hdr.height)
+                if self._sibling_enqueue_counts.get(h_key, 0) >= 4:
+                    continue
             if self._has_block(hdr.hash) and not self._needs_local_block_replay(
                 hdr.hash, height_hint=hdr.height
             ):
@@ -10127,6 +10210,17 @@ class P2PService:
             self._sync_block_queue.append(hdr.hash)
             self._sync_block_queue_set.add(hdr.hash)
             self._sync_block_queue_heights[hdr.hash] = hdr.height
+            if hdr.height <= int(local_height or 0):
+                h_key = int(hdr.height)
+                self._sibling_enqueue_counts[h_key] = (
+                    self._sibling_enqueue_counts.get(h_key, 0) + 1
+                )
+                if len(self._sibling_enqueue_counts) > 256:
+                    floor = int(local_height or 0) - _max_reorg_depth()
+                    for k in [
+                        k for k in self._sibling_enqueue_counts if k < floor
+                    ]:
+                        del self._sibling_enqueue_counts[k]
             added += 1
         if added:
             self._sync_wakeup.set()
@@ -11053,7 +11147,29 @@ class P2PService:
         )
         if not headers:
             if trimmed_overlap > 0:
-                if not self._is_sync_target_ahead(local_anchor_height):
+                batch_limit = max(1, int(self._max_headers_per_message or 0))
+                overlap_filled_batch = trimmed_overlap >= batch_limit
+                if overlap_filled_batch:
+                    # The peer FILLED the response with headers we already have:
+                    # it provably has at least a full window more chain than the
+                    # window we asked about, yet we accepted nothing. This is
+                    # the 28167/38728 wedge signature (a node parked on the
+                    # losing side of a fork re-receiving its own prefix), not
+                    # benign tip idling — do NOT reset the stall clock, or the
+                    # watchdog/recovery paths can never fire.
+                    self._sync_overlap_full_batches += 1
+                    log.warning(
+                        "Full-window overlap-only headers batch; not counting as progress",
+                        extra={
+                            "remote": peer.remote,
+                            "local_height": local_anchor_height,
+                            "trimmed_overlap": trimmed_overlap,
+                            "consecutive_full_overlap": self._sync_overlap_full_batches,
+                            "network_best_height": self._network_best_height(),
+                        },
+                    )
+                elif not self._is_sync_target_ahead(local_anchor_height):
+                    self._sync_overlap_full_batches = 0
                     self._note_header_progress(peer, reason="headers_overlap")
                 else:
                     log.info(
@@ -11159,15 +11275,36 @@ class P2PService:
                         and header.hash == local_anchor_hash
                     )
                 ):
-                    order, reason = self._note_not_anchored(
-                        peer,
-                        header=header,
-                        anchor_height=local_anchor_height,
-                        anchor_hash=local_anchor_hash,
-                        reason="anchor_mismatch",
-                        allow_probe=True,
-                    )
-                    return order, reason, {"anchor_mismatch": len(headers)}
+                    if self._is_fork_sibling_header(header):
+                        # The batch starts with the WINNING sibling of a fork we
+                        # took the losing side of. Discarding it here (the
+                        # legacy anchor_mismatch path) is what wedged nodes at
+                        # 38728 for days: the competing branch base could never
+                        # reach fork choice, so the reorg never happened. Let
+                        # the batch flow — the parent-anchor checks below
+                        # validate it against its (canonical) parent — and make
+                        # sure its block gets fetched even if the header was
+                        # already buffered.
+                        log.warning(
+                            "Fork sibling at/below local head — ingesting competing branch",
+                            extra={
+                                "remote": peer.remote,
+                                "height": int(header.height),
+                                "sibling_hash": header.hash.hex(),
+                                "local_height": local_anchor_height,
+                            },
+                        )
+                        self._enqueue_missing_blocks([header])
+                    else:
+                        order, reason = self._note_not_anchored(
+                            peer,
+                            header=header,
+                            anchor_height=local_anchor_height,
+                            anchor_hash=local_anchor_hash,
+                            reason="anchor_mismatch",
+                            allow_probe=True,
+                        )
+                        return order, reason, {"anchor_mismatch": len(headers)}
                 if header.height == 0:
                     if header.hash != expected_genesis:
                         self._stats["p2p_peers_rejected_genesis_mismatch"] += 1
