@@ -168,10 +168,33 @@ def _mine_header_gpu(
     from mining.gpu_torch_sha3 import NONCE_BAND_HI, NONCE_BAND_LO, scan_solo
     import secrets
 
-    batch = max(1, int(os.getenv("ANIMICA_MINER_GPU_BATCH", str(1 << 18))))
-    window = max(batch, int(os.getenv("ANIMICA_MINER_GPU_WINDOW", str(1 << 23))))
+    # 0 == auto: let scan_solo size each launch to free VRAM so big cards saturate
+    # (the old fixed 2^18 batch starved them). Set ANIMICA_MINER_GPU_BATCH to pin it.
+    batch = int(os.getenv("ANIMICA_MINER_GPU_BATCH", "0"))
+    # A larger default window means more big launches per scan_solo call, amortizing the
+    # per-call setup; keep it >= any explicit batch so a pinned huge batch still fits.
+    window = int(os.getenv("ANIMICA_MINER_GPU_WINDOW", str(1 << 26)))
+    window = max(window, batch, 1 << 20)
     max_total = max(window, int(os.getenv("ANIMICA_MINER_GPU_MAX_TOTAL", str(1 << 31))))
     total_windows = max(1, max_total // window)
+
+    # Fused CUDA Keccak scanner: one thread hashes one nonce entirely in registers
+    # (compute-dense) instead of the memory-bound element-wise torch Keccak. Same
+    # signature and the same host re-verification, so it's a safe drop-in; on any
+    # compile/launch/self-test failure we transparently fall back to the torch path.
+    # Opt out with ANIMICA_MINER_CUDA_FUSED=0.
+    use_fused = False
+    scan_cuda = None
+    if device.startswith("cuda"):
+        try:
+            from mining.gpu_cuda_sha3 import cuda_kernel_available, scan_solo_cuda
+            if cuda_kernel_available():
+                scan_cuda = scan_solo_cuda
+                use_fused = True
+        except Exception:
+            use_fused = False
+    if stats is not None:
+        stats["backend"] = "cuda-fused" if use_fused else "torch"
 
     if stats is not None:
         stats.setdefault("hashes", 0)
@@ -181,15 +204,34 @@ def _mine_header_gpu(
     start = NONCE_BAND_LO + secrets.randbelow(max(1, span - window))
     try:
         for _ in range(total_windows):
-            nonce, digest = scan_solo(
-                header,
-                target_int,
-                start_nonce=start,
-                iterations=window,
-                device=device,
-                batch_size=batch,
-                stats=stats,
-            )
+            nonce = digest = None
+            if use_fused and scan_cuda is not None:
+                try:
+                    nonce, digest = scan_cuda(
+                        header,
+                        target_int,
+                        start_nonce=start,
+                        iterations=window,
+                        device=device,
+                        batch_size=batch,
+                        stats=stats,
+                    )
+                except Exception:
+                    # Fused kernel unusable on this device — fall back for good.
+                    use_fused = False
+                    scan_cuda = None
+                    if stats is not None:
+                        stats["backend"] = "torch"
+            if not use_fused or scan_cuda is None:
+                nonce, digest = scan_solo(
+                    header,
+                    target_int,
+                    start_nonce=start,
+                    iterations=window,
+                    device=device,
+                    batch_size=batch,
+                    stats=stats,
+                )
             if nonce is not None and digest is not None:
                 return nonce, digest
             start += window
