@@ -1,0 +1,118 @@
+---
+title: "Animica — Overview"
+description: "A high-level tour of the Animica stack: consensus (PoIES), DA, Python VM, ZK, AICF, P2P, SDKs, wallet, explorer, and tooling."
+layout: ../layouts/DocsLayout.astro
+---
+
+import InlineLink from "../components/InlineLink.astro";
+
+> This is an **optional built-in landing page** for the docs.  
+> If you host canonical documentation elsewhere, you can safely remove this file and rely on the `/docs` redirect behavior.
+
+## What is Animica?
+
+Animica is a modular L1/L2 stack that combines **PoIES consensus** (Proof-of-Integrated-External-Services), **Data Availability** with Namespaced Merkle Trees and erasure coding, a **deterministic Python VM**, **ZK verification** helpers, an **AI Compute Fund (AICF)**, and a **PQ-first key system**. It ships with a developer **Studio** (desktop IDE; the hosted web version is being rebuilt), **Explorer**, browser **wallet**, and SDKs in **Python**, **TypeScript**, and **Rust**.
+
+---
+
+## Quick links
+
+- **Getting started** → <InlineLink href="https://github.com/animicaorg/all/blob/main/docs/quickstart-devnet.md">docs/quickstart-devnet.md</InlineLink>  
+- **Consensus (PoIES)** → <InlineLink href="https://github.com/animicaorg/all/blob/main/spec/poies_math.md">spec/poies_math.md</InlineLink>  
+- **Data Availability** → <InlineLink href="https://github.com/animicaorg/all/blob/main/docs/DA.md">docs/DA.md</InlineLink>  
+- **Python VM** → <InlineLink href="https://github.com/animicaorg/all/tree/main/docs/vm">docs/vm</InlineLink>  
+- **ZK Verifiers** → <InlineLink href="https://github.com/animicaorg/all/tree/main/zk">zk/</InlineLink>  
+- **AICF** → <InlineLink href="https://github.com/animicaorg/all/blob/main/docs/AICF.md">docs/AICF.md</InlineLink>  
+- **SDKs** → <InlineLink href="https://github.com/animicaorg/all/tree/main/sdk">sdk/</InlineLink>  
+- **Operations/Devnet** → <InlineLink href="https://github.com/animicaorg/all/tree/main/docs/ops">docs/ops</InlineLink>
+
+---
+
+## Architecture at a glance
+
+- **Consensus (PoIES)** — blocks are accepted when `S = H(u) + Σ ψ ≥ Θ`, with fairness controls and caps `Γ` to balance proof types.
+- **DA** — blob commitments become DA roots via NMT; light clients verify availability with sampling & proofs.
+- **Execution** — a deterministic Python VM with a small IR, ABI, and strict gas model.
+- **ZK** — built-in verifiers (Groth16/PLONK/STARK), Poseidon/KZG helpers, and policy pinning for VKs.
+- **AICF** — off-chain compute providers (AI/Quantum) with attestations, SLAs, pricing, and settlements.
+- **Networking** — PQ-first P2P handshake (Kyber+HKDF), transports (TCP/QUIC/WS), gossip topics, and sync flows.
+- **Tooling** — Studio (simulate → deploy → verify), Explorer, wallet extension, and multi-language SDKs.
+
+---
+
+## Hello, mainnet (60 seconds)
+
+The `animica` package on PyPI ships the CLI and Python client libraries.
+The commands below are illustrative — run `animica --help` for the exact surface.
+
+```bash
+# 1) Install the CLI + Python SDK
+#    The complete client: mine, run a node, use the wallet, deploy Python
+#    contracts, run `animica up` (the unified miner: PoW + useful-work +
+#    GPU train/serve + Studio functions), and use the Studio SDK. The native
+#    CPU miner (animica-fastpow) is included BY DEFAULT. Most people want this.
+pip install animica
+
+#    Or grab the kitchen sink — everything above PLUS every optional extra:
+#    Qt desktop-wallet QR codes, the full distributed Studio client (cloudpickle
+#    closures + omni-sdk on-chain ANM escrow), and all server/operator deps
+#    pinned. Use it for pool/API infrastructure. Quote the brackets so
+#    zsh/macOS does not glob them:
+pip install "animica[all]"
+
+# 2) Create a wallet (keys stay local; addresses are bech32m anim1...)
+animica wallet create --label mywallet
+animica wallet show mywallet
+
+# 3) Talk to the live network via the public RPC
+#    (JSON-RPC, POST only: https://rpc.animica.org/rpc)
+animica chain head --rpc-url https://rpc.animica.org/rpc
+
+# 4) Studio: the hosted web IDE is being rebuilt — use the Linux
+#    desktop build from /studio for compile & simulate workflows.
+
+
+⸻
+
+Contracts: Python VM (Counter example)
+
+# examples/counter/contract.py
+from stdlib.storage import get_int, set_int
+from stdlib.events import emit
+
+def inc():
+    v = get_int(b"count") + 1
+    set_int(b"count", v)
+    emit(b"Inc", {"value": v})
+
+def get() -> int:
+    return get_int(b"count")
+
+	•	Deterministic interpretation (no I/O, no time, no randomness except seeded PRNG for tests).
+	•	ABI encoding/decoding is canonical; gas metering is first-class.
+
+⸻
+
+ZK verification (outline)
+	•	Groth16 (BN254) — snarkjs JSON-compatible loader + verifier.
+	•	PLONK (KZG BN254) — single-opening demo verifier for small circuits.
+	•	STARK (FRI) — minimal verifier for toy AIRs (e.g., Merkle membership).
+	•	Poseidon — hash parameters used in circuits.
+	•	VK pinning — registry with signatures/hashes to prevent malleability.
+
+See <InlineLink href="https://github.com/animicaorg/all/tree/main/zk">zk/ on GitHub</InlineLink>.
+
+⸻
+
+Where to next?
+	•	Read the PoIES math & policy → https://github.com/animicaorg/all/blob/main/spec/poies_math.md
+	•	Get the Studio desktop build → /studio
+	•	Explore the network status → /status
+	•	Browse SDK examples → https://github.com/animicaorg/all/tree/main/sdk
+
+⸻
+
+Feedback
+
+Found a bug or have a question?
+Open an issue at https://github.com/animicaorg/all/issues. Contributions welcome!
