@@ -1,9 +1,0 @@
-{
-  "extends": "astro/tsconfigs/strict",
-  "compilerOptions": {
-    "allowJs": true,
-    "verbatimModuleSyntax": true,
-    "types": ["astro/client"]
-  },
-  "include": ["src/**/*", "astro.config.mjs"]
-}

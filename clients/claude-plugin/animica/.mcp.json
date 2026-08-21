@@ -1,9 +1,0 @@
-{
-  "animica": {
-    "command": "uvx",
-    "args": ["--from", "animica[mcp]", "animica", "mcp", "serve"],
-    "env": {
-      "ANIMICA_BASE_URL": "https://pool.animica.org/v1"
-    }
-  }
-}

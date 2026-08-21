@@ -1,5 +1,0 @@
-# Secrets & local state — never commit.
-.env
-data/
-node_modules/
-*.log

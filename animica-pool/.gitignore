@@ -1,8 +1,0 @@
-node_modules
-dist
-.next
-.next-prod
-.env
-*.log
-coverage
-.turbo

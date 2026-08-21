@@ -1,1 +1,0 @@
-"""{{name}} — FastAPI application package."""
