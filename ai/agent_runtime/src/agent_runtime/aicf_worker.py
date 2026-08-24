@@ -28,7 +28,8 @@ from agent_runtime.aicf_client import AICFClient
 from agent_runtime.config import Config, load_config
 from agent_runtime.errors import AgentRuntimeError, BundleError
 from agent_runtime.hardware import (
-    HardwareProfile, attach_eligible_tiers, detect_hardware,
+    HardwareProfile, attach_eligible_tiers, canonical_tier, chain_tiers,
+    detect_hardware,
 )
 
 
@@ -111,8 +112,11 @@ def _has_servable_bundle(tier: str) -> bool:
     stub bridge on every claim.
     """
     try:
+        # Normalize any vocabulary (e.g. stratum 'standard') to the catalog id
+        # ('small') so the bundle dir actually resolves.
         base = Path(os.environ.get(
-            "ANIMICA_DATA_DIR", "~/.animica")).expanduser() / "models" / str(tier)
+            "ANIMICA_DATA_DIR", "~/.animica")).expanduser() / "models" / \
+            canonical_tier(tier)
         if not base.is_dir():
             return False
         for bundle in base.iterdir():
@@ -126,14 +130,21 @@ def _has_servable_bundle(tier: str) -> bool:
 
 def resolve_tiers(profile: HardwareProfile, catalog: dict,
                   *, override: Optional[list[str]] = None) -> list[str]:
+    # These tiers are what the worker ADVERTISES to the AICF node (register +
+    # claim), so they must be in the node's stratum/chain vocabulary
+    # (free/standard/premium/elite) — the node folds anything else to "standard"
+    # and the worker would only ever get standard jobs. chain_tiers() accepts
+    # either vocabulary in and always emits chain names. The on-disk BUNDLE for a
+    # given tier is resolved separately via canonical_tier() (bundle dir uses the
+    # catalog id). This is the bidirectional reconciliation.
     if override:
-        return list(override)
+        return chain_tiers(override)
     attach_eligible_tiers(profile, catalog)
     if profile.eligible_tiers:
-        return list(profile.eligible_tiers)
+        return chain_tiers(profile.eligible_tiers)
     fallback = catalog.get("propagation", {}).get(
         "fallback_tier_on_detect_fail", "tiny")
-    return [str(fallback)]
+    return chain_tiers([fallback])
 
 
 # --------------------------------------------------------------------------- #
@@ -404,7 +415,13 @@ class AICFWorker:
             idle_streak = 0
             tier = str(job.get("tier", self.tiers[0]))
             job_id = str(job.get("job_id", ""))
-            prompt = str(job.get("prompt", ""))
+            # The node nests the prompt + sampling under job["spec"]; only the
+            # pipeline path read spec — this chat path read the top level and so
+            # passed an EMPTY prompt to the model (every answer was "I didn't
+            # receive a question"). Read spec first, fall back to top level so
+            # this works against both a nested and a flattened claim response.
+            _spec = job.get("spec") if isinstance(job.get("spec"), dict) else {}
+            prompt = str(_spec.get("prompt", job.get("prompt", "")))
             try:
                 runner = runners.get(tier)
                 if runner is None:
@@ -413,9 +430,11 @@ class AICFWorker:
                 t0 = time.time()
                 text = runner.generate(
                     prompt=prompt, history=[],
-                    max_output_tokens=int(job.get("max_output_tokens", 512)),
-                    temperature=float(job.get("temperature", 0.2)),
-                    top_p=float(job.get("top_p", 0.95)),
+                    max_output_tokens=int(_spec.get("max_output_tokens",
+                                          job.get("max_output_tokens", 512))),
+                    temperature=float(_spec.get("temperature",
+                                      job.get("temperature", 0.2))),
+                    top_p=float(_spec.get("top_p", job.get("top_p", 0.95))),
                 )
                 latency_ms = int((time.time() - t0) * 1000)
                 attestation = {
@@ -457,7 +476,7 @@ class AICFWorker:
         from flagship_agent.inference import LocalBundleRunner
         cache = Path(os.environ.get(
             "ANIMICA_DATA_DIR", "~/.animica")).expanduser() / \
-            "models" / tier
+            "models" / canonical_tier(tier)
         if not cache.is_dir():
             raise BundleError(
                 f"no installed flagship bundle for tier={tier!r}",
